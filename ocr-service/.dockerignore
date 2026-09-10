@@ -1,0 +1,12 @@
+.venv
+.venv*
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+output.*
+trace*.log
+test*.py
+sample.jpg
+=3.7.0

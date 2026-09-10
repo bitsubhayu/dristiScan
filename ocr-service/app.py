@@ -341,6 +341,14 @@ def get_capture_tips():
         "optimal_lighting": "Diffused daylight or soft indoor lighting"
     }
 
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "DrishtiScan OCR Microservice",
+        "engine": "PaddleOCR 3.7.0 (PP-OCRv6)"
+    }
+
 @app.get("/health")
 def health_check():
     return {
@@ -350,5 +358,6 @@ def health_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
