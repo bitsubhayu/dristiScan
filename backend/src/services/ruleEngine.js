@@ -29,6 +29,35 @@ const DEFAULT_FALLBACK_RULES = [
     { ruleCode: 'EX-01', field: 'exemptionSmallPackage', validation: { type: 'exemption' } },
 ];
 
+/**
+ * Parses date string (e.g. "03/2026", "MAR 2026", "15-03-2026") to month and year indices
+ * for chronological cross-validation.
+ */
+const parseDateToMonthYear = (dStr) => {
+    if (!dStr) return null;
+    const months = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
+    const tm = String(dStr).match(/([A-Za-z]{3})[\s./-]*(\d{2,4})/);
+    if (tm) {
+        const m = months[tm[1].toUpperCase()];
+        let y = parseInt(tm[2], 10);
+        if (y < 100) y += 2000;
+        if (m && y) return { month: m, year: y, totalMonths: y * 12 + m };
+    }
+    const my = String(dStr).match(/(\d{1,2})[/](\d{4})/);
+    if (my) {
+        const m = parseInt(my[1], 10);
+        const y = parseInt(my[2], 10);
+        if (m >= 1 && m <= 12 && y) return { month: m, year: y, totalMonths: y * 12 + m };
+    }
+    const full = String(dStr).match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+    if (full) {
+        const m = parseInt(full[2], 10);
+        const y = parseInt(full[3], 10);
+        if (m >= 1 && m <= 12 && y) return { month: m, year: y, totalMonths: y * 12 + m };
+    }
+    return null;
+};
+
 const evaluateRules = async (extracted) => {
     let rules = [];
     try {
@@ -53,6 +82,7 @@ const evaluateRules = async (extracted) => {
     const fields = extracted.normalizedFields || extracted;
     const rawOcr = extracted.rawOcrText || [];
     const totalDetectedElements = Array.isArray(rawOcr) ? rawOcr.length : 0;
+    const declarations = extracted.declarations || fields.declarations || {};
 
     // Safety check: Completely unreadable or blank image with zero OCR text
     const isUnreadable = totalDetectedElements === 0;
@@ -151,10 +181,36 @@ const evaluateRules = async (extracted) => {
         else if (code === 'LM-04' || valType === 'net_quantity') {
             // Net Quantity (Weight, Volume, or Count of Commodity)
             const nq = fields.netQuantity;
+            const servings = fields.servingsPerContainer;
+            const servingSize = fields.servingSize;
+
             if (nq && nq.value !== null && nq.unit !== null) {
                 status = 'PASS';
                 extractedValue = `${nq.value} ${nq.unit}`;
                 reason = `Net quantity declared in standard metric units: ${nq.value} ${nq.unit}`;
+
+                // Cross-field arithmetic validation: netQuantity vs servingSize & servingsPerContainer
+                if (servings !== null && servings !== undefined) {
+                    let servingSizeNum = null;
+                    if (typeof servingSize === 'number') {
+                        servingSizeNum = servingSize;
+                    } else if (typeof servingSize === 'string') {
+                        const m = servingSize.match(/(\d+(?:\.\d+)?)/);
+                        if (m) servingSizeNum = parseFloat(m[1]);
+                    }
+
+                    if (servingSizeNum && servingSizeNum > 0 && ['g', 'ml'].includes((nq.unit || '').toLowerCase())) {
+                        const expectedServings = nq.value / servingSizeNum;
+                        const ratio = servings / expectedServings;
+                        // Discrepancy > 25% (i.e. ratio < 0.75 or ratio > 1.25)
+                        if (ratio < 0.75 || ratio > 1.25) {
+                            status = 'REVIEW';
+                            reason = `Discrepancy detected: Servings per container (${servings}) does not match net quantity (${nq.value}${nq.unit}) / serving size (${servingSizeNum}g) = ~${Math.round(expectedServings)} expected servings.`;
+                        } else {
+                            reason += ` (Plausibility verified: ${nq.value}${nq.unit} ÷ ${servingSizeNum}g ≈ ${Math.round(expectedServings)} servings, matching declared ${servings})`;
+                        }
+                    }
+                }
             } else if (fields.servingsPerContainer !== null && (!nq || nq.value === null)) {
                 // Servings was detected, but standard net quantity is missing!
                 status = 'INSUFFICIENT_EVIDENCE';
@@ -187,10 +243,29 @@ const evaluateRules = async (extracted) => {
         else if (code === 'LM-06' || valType === 'conditional_date') {
             // Date of Manufacture / Packing / Import
             const mfg = fields.dates?.manufacture;
+            const exp = fields.dates?.expiry || fields.dates?.bestBefore;
             if (mfg) {
                 status = 'PASS';
                 extractedValue = mfg;
                 reason = `Manufacturing / packing date declared: ${mfg}`;
+
+                // Chronological validation if expiry date is also present
+                if (exp) {
+                    const mfgParsed = parseDateToMonthYear(mfg);
+                    const expParsed = parseDateToMonthYear(exp);
+                    if (mfgParsed && expParsed) {
+                        if (mfgParsed.totalMonths >= expParsed.totalMonths) {
+                            status = 'POTENTIAL_NON_COMPLIANCE';
+                            reason = `Invalid chronological sequence: Manufacturing date (${mfg}) is equal to or later than expiry date (${exp}).`;
+                        } else {
+                            const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
+                            if (shelfLifeMonths > 60) {
+                                status = 'REVIEW';
+                                reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}). Officer review required.`;
+                            }
+                        }
+                    }
+                }
             } else {
                 status = 'INSUFFICIENT_EVIDENCE';
                 reason = 'Month and year of manufacture or prepacking could not be established from visible panels.';
@@ -200,10 +275,29 @@ const evaluateRules = async (extracted) => {
         else if (code === 'LM-07') {
             // Best Before / Expiry Date
             const exp = fields.dates?.expiry || fields.dates?.bestBefore;
+            const mfg = fields.dates?.manufacture;
             if (exp) {
                 status = 'PASS';
                 extractedValue = exp;
                 reason = `Best before / use-by declaration detected: ${exp}`;
+
+                // Chronological validation if mfg date is also present
+                if (mfg) {
+                    const mfgParsed = parseDateToMonthYear(mfg);
+                    const expParsed = parseDateToMonthYear(exp);
+                    if (mfgParsed && expParsed) {
+                        if (mfgParsed.totalMonths >= expParsed.totalMonths) {
+                            status = 'POTENTIAL_NON_COMPLIANCE';
+                            reason = `Invalid chronological sequence: Expiry date (${exp}) is before or equal to manufacturing date (${mfg}).`;
+                        } else {
+                            const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
+                            if (shelfLifeMonths > 60) {
+                                status = 'REVIEW';
+                                reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}).`;
+                            }
+                        }
+                    }
+                }
             } else {
                 status = 'INSUFFICIENT_EVIDENCE';
                 reason = 'Best before or use-by declaration not detected on scanned panels.';
@@ -227,10 +321,44 @@ const evaluateRules = async (extracted) => {
         else if (code === 'LM-09' || valType === 'unit_sale_price') {
             // Unit Sale Price (USP)
             const usp = fields.unitSalePrice;
+            const mrp = fields.mrp;
+            const nq = fields.netQuantity;
+
             if (usp) {
                 status = 'PASS';
                 extractedValue = usp;
                 reason = `Unit Sale Price declared: ${usp}`;
+
+                // Cross-field arithmetic validation against MRP ÷ Net Qty
+                if (mrp?.value && nq?.value && nq.value > 0) {
+                    const uspMatch = String(usp).match(/(?:₹|Rs\.?|INR)?\s*(\d+(?:\.\d+)?)/i);
+                    if (uspMatch) {
+                        const declaredUspVal = parseFloat(uspMatch[1]);
+                        const isPer100g = /100\s*(?:g|ml)/i.test(usp);
+                        const isPerGram = /\b(?:g|gm|gram|ml)\b/i.test(usp) && !isPer100g;
+                        const isPerKg = /\b(?:kg|kilo|liter|l)\b/i.test(usp);
+
+                        let expectedUsp = null;
+                        if (isPer100g) {
+                            expectedUsp = (mrp.value / nq.value) * 100;
+                        } else if (isPerGram) {
+                            expectedUsp = mrp.value / nq.value;
+                        } else if (isPerKg) {
+                            const nqInKg = ['g', 'ml'].includes((nq.unit || '').toLowerCase()) ? nq.value / 1000 : nq.value;
+                            expectedUsp = mrp.value / nqInKg;
+                        }
+
+                        if (expectedUsp !== null && declaredUspVal > 0) {
+                            const diffRatio = Math.abs(declaredUspVal - expectedUsp) / expectedUsp;
+                            if (diffRatio > 0.15) { // more than 15% discrepancy
+                                status = 'REVIEW';
+                                reason = `Unit Sale Price discrepancy: Declared (${usp}) differs from calculated rate (₹${expectedUsp.toFixed(2)} based on MRP ₹${mrp.value} and ${nq.value}${nq.unit}).`;
+                            } else {
+                                reason += ` (Verified: matches calculated ₹${expectedUsp.toFixed(2)} within tolerance)`;
+                            }
+                        }
+                    }
+                }
             } else {
                 // If package contains > 1 unit or weight > 100g, USP is recommended/required
                 status = 'REVIEW';
@@ -254,6 +382,32 @@ const evaluateRules = async (extracted) => {
             // Generic rules not applicable to this physical retail form
             status = 'NOT_APPLICABLE';
             reason = 'Rule requirement does not apply to this packaged commodity form.';
+        }
+
+        // ---------------------------------------------------------
+        // C. Uncertainty & Provenance Propagation from Declarations
+        // ---------------------------------------------------------
+        const RULE_DECLARATION_MAP = {
+            'LM-01': ['manufacturer', 'packer', 'importer'],
+            'LM-02': ['countryOfOrigin'],
+            'LM-03': ['genericCommodityName', 'productName'],
+            'LM-04': ['netQuantity'],
+            'LM-05': ['mrp'],
+            'LM-06': ['manufactureDate'],
+            'LM-07': ['expiryDate'],
+            'LM-08': ['consumerCare'],
+            'LM-09': ['unitSalePrice'],
+            'LM-10': ['batchNumber']
+        };
+
+        const declKeys = RULE_DECLARATION_MAP[code] || [];
+        const declObj = declKeys.map(k => declarations[k]).find(Boolean);
+        if (declObj && status === 'PASS') {
+            if (declObj.status === 'unverified' || declObj.needsReview === true || (typeof declObj.confidence === 'number' && declObj.confidence < 0.65)) {
+                status = 'REVIEW';
+                const confDisplay = typeof declObj.confidence === 'number' ? `${Math.round(declObj.confidence * 100)}%` : 'unverified';
+                reason += ` [Officer Review Required: Field declaration carries uncertainty (${confDisplay} confidence).]`;
+            }
         }
 
         findings.push({

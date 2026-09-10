@@ -228,16 +228,18 @@ Respond in this exact JSON format (no markdown, no code fences):
             contents: prompt,
             config: {
                 temperature: 0.1,
-                maxOutputTokens: 2048,
+                maxOutputTokens: 8192,
+                responseMimeType: 'application/json',
             }
         });
 
         const text = response.text.trim();
         
-        // Parse JSON from response (strip any markdown fences if present)
+        // Parse JSON from response (strip any markdown fences if present and clean trailing commas)
         let parsed;
         try {
-            const jsonStr = text.replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
+            let jsonStr = text.replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
+            jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
             parsed = JSON.parse(jsonStr);
         } catch (parseErr) {
             console.error('[GeminiService] Failed to parse reconciliation response:', parseErr.message);
@@ -296,9 +298,10 @@ const fallbackReadFields = async (imageBuffer, fieldsToRead = [], mimeType = 'im
         'marketer.address': 'the marketer full address',
         'packer.name': 'the packer name (look for "Packed By")',
         'importer.name': 'the importer name (look for "Imported By")',
+        'mrp': 'the Maximum Retail Price / MRP in INR (₹) — a bold, prominent retail price (e.g., 999 or 1499), usually printed with "inclusive of all taxes" or "Incl. of all taxes" nearby — distinct from the smaller per-unit price (USP)',
         'unitSalePrice': 'the Unit Sale Price or USP (a price per unit, NOT the MRP)',
         'netQuantity': 'the net quantity/weight/volume declaration — MUST be a number + unit (e.g. "300 g", "500 ml", "60 capsules"). Must NOT contain ingredient text or nutrition information.',
-        'countryOfOrigin': 'the Country of Origin declaration',
+        'countryOfOrigin': 'the Country of Origin declaration (e.g., "India", "Made in India", "Country of Origin: India")',
         'consumerCare.phone': 'the consumer care / customer care phone number',
         'consumerCare.email': 'the consumer care / customer care email address',
         'fssaiLicenseNumber': 'the FSSAI license number (a 14-digit number)',
@@ -325,11 +328,13 @@ Rules:
 - For netQuantity, return ONLY the number and unit (e.g. "300 g"). Do NOT include ingredient text, nutrition data, or any other adjacent content.
 - For identity fields (brandName, productName, genericCommodityName), do NOT include marketing badges like "100% Authentic", "Certified", "Premium", or quality claims. These are not identity declarations.
 - brandName is the company/brand trade name. productName is the specific product/variant name. genericCommodityName is the common/generic commodity description.
+- For every non-null field, include the exact "sourcePhrase" visible on the package that contains or anchors this value.
 
 Respond in this exact JSON format (no markdown, no code fences):
 {
   "<fieldName>": {
     "value": "extracted value or null",
+    "sourcePhrase": "exact text snippet as printed on label or null",
     "reasoning": "brief explanation of where on the label this was found, or why it couldn't be found"
   }
 }`;
@@ -356,7 +361,8 @@ Respond in this exact JSON format (no markdown, no code fences):
             ],
             config: {
                 temperature: 0.1,
-                maxOutputTokens: 2048,
+                maxOutputTokens: 8192,
+                responseMimeType: 'application/json',
             }
         });
 
@@ -364,7 +370,8 @@ Respond in this exact JSON format (no markdown, no code fences):
         
         let parsed;
         try {
-            const jsonStr = text.replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
+            let jsonStr = text.replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
+            jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
             parsed = JSON.parse(jsonStr);
         } catch (parseErr) {
             console.error('[GeminiService] Failed to parse fallback response:', parseErr.message);
@@ -378,6 +385,7 @@ Respond in this exact JSON format (no markdown, no code fences):
             if (data && data.value !== null && data.value !== undefined && data.value !== '') {
                 validResults[field] = {
                     value: data.value,
+                    sourcePhrase: data.sourcePhrase || null,
                     reasoning: data.reasoning || 'Recovered by Gemini fallback'
                 };
             }

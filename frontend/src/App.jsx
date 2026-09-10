@@ -237,7 +237,9 @@ function ConsumerView({ onSwitchToOfficer }) {
     const decl = ef.declarations?.[declKey];
     if (!decl) return false;
     if (decl.aiAssisted === true || decl.source === 'gemini_fallback') return true;
-    if (fieldKey.includes('.') && decl[fieldKey.split('.')[1]]?.aiAssisted) return true;
+    if (decl.status === 'unverified' || decl.needsReview === true) return true;
+    if (typeof decl.confidence === 'number' && decl.confidence < 0.65) return true;
+    if (fieldKey.includes('.') && (decl[fieldKey.split('.')[1]]?.aiAssisted || decl[fieldKey.split('.')[1]]?.needsReview)) return true;
     return false;
   };
 
@@ -797,7 +799,9 @@ function OfficerScanView({ user, onNavigateToRepo }) {
     const decl = ef.declarations?.[declKey];
     if (!decl) return false;
     if (decl.aiAssisted === true || decl.source === 'gemini_fallback') return true;
-    if (fieldKey.includes('.') && decl[fieldKey.split('.')[1]]?.aiAssisted) return true;
+    if (decl.status === 'unverified' || decl.needsReview === true) return true;
+    if (typeof decl.confidence === 'number' && decl.confidence < 0.65) return true;
+    if (fieldKey.includes('.') && (decl[fieldKey.split('.')[1]]?.aiAssisted || decl[fieldKey.split('.')[1]]?.needsReview)) return true;
     return false;
   };
 

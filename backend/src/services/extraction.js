@@ -755,7 +755,9 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     }
     // Bug 4 fix: Also capture standalone "N Servings" (e.g. "100 Servings" on front label)
     if (!servingsPerContainer) {
-        const standaloneServings = fullText.match(/\b(\d+)\s*Servings?\b/i);
+        // Strip out net weight declarations first to avoid "Net wt. 300 Servings" stream collision
+        const cleanServingsText = fullText.replace(/(?:net\s*wt\.?|net\s*weight|net\s*quantity)\s*[:.-]?\s*\d+/gi, ' ');
+        const standaloneServings = cleanServingsText.match(/\b(\d+)\s*Servings?\b/i);
         if (standaloneServings) {
             servingsPerContainer = parseInt(standaloneServings[1], 10);
             servingsElem = rawElements.find(r => /\d+\s*Servings?\b/i.test(r.text)) || null;
@@ -802,15 +804,21 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     let netQtyUnit = null;
     let netQtyElem = null;
 
-    // Pattern A: Explicit "Net Qty / Net Weight / Net Contents: X unit"
-    const explicitQtyRegex = /(?:Net\s*(?:Qty|Quantity|Weight|Wt|Vol|Contents)?\.?\s*[:.-]?\s*)(\d+(?:\.\d+)?)\s*(ml|g|kg|l|liter|litre|mg)\b/i;
+    // Pattern A: Explicit "Net Qty / Net Weight / Net Wt: X unit" (unit optional on packaging e.g. "Net wt. 300")
+    const explicitQtyRegex = /(?:Net\s*(?:Qty|Quantity|Weight|Wt|Vol|Contents)?\.?\s*[:.-]?\s*)(\d+(?:\.\d+)?)(?:\s*(ml|g|kg|l|liter|litre|mg))?\b/i;
     for (const el of rawElements) {
+        // Skip nutrition table elements
+        if (/per\s*serving|amount\s*per|nutrition/i.test(el.text)) continue;
         const eqm = el.text.match(explicitQtyRegex);
         if (eqm) {
-            netQtyVal = parseFloat(eqm[1]);
-            netQtyUnit = eqm[2].toLowerCase();
-            netQtyElem = el;
-            break;
+            const valCandidate = parseFloat(eqm[1]);
+            // Only accept if preceded by Net or Wt or Weight
+            if (/(?:Net|Weight|Wt|Contents)/i.test(el.text)) {
+                netQtyVal = valCandidate;
+                netQtyUnit = (eqm[2] || 'g').toLowerCase();
+                netQtyElem = el;
+                break;
+            }
         }
     }
 
@@ -830,23 +838,24 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    // Pattern C: Prominent standalone weight/volume (e.g., "500 g", "1 kg") if >= 10
+    // Pattern C: Prominent standalone weight/volume (e.g., "500 g", "1 kg") if >= 5
     if (!netQtyVal) {
         const standaloneWeightRegex = /^(\d+(?:\.\d+)?)\s*(g|kg|ml|l)\b/i;
-        for (const el of rawElements) {
-            if (/protein|fat|sugar|sodium|carb|per|serving/i.test(el.text)) continue;
+        for (let i = 0; i < rawElements.length; i++) {
+            const el = rawElements[i];
+            // Reject if this or adjacent elements indicate nutrition facts table
+            const nearbyText = rawElements.slice(Math.max(0, i - 2), i + 3).map(r => r.text).join(' ');
+            if (/protein|fat|sugar|sodium|carb|per\s*100|amount\s*per|nutrition|typical\s*values/i.test(nearbyText)) continue;
+            
             const swm = el.text.match(standaloneWeightRegex);
             if (swm) {
                 const num = parseFloat(swm[1]);
                 if (num >= 5) {
                     // Bug 4 fix: Reject if value matches servingsPerContainer AND nearby text says "Servings"
                     if (servingsPerContainer !== null && num === servingsPerContainer) {
-                        // Check if this element or adjacent elements mention "Servings"
-                        const elIdx = rawElements.indexOf(el);
-                        const nearbyText = rawElements.slice(Math.max(0, elIdx - 2), elIdx + 3).map(r => r.text).join(' ');
                         if (/serving/i.test(nearbyText)) {
                             console.log(`[Extraction] Bug4 guard: Rejected ${num} ${swm[2]} as net quantity — matches servingsPerContainer and "Servings" is nearby`);
-                            continue; // Skip this candidate
+                            continue;
                         }
                     }
                     netQtyVal = num;
@@ -1416,13 +1425,15 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (val === null || val === undefined || val === '') lowConfidenceFields.push(name);
         else if (typeof conf === 'number' && conf < GEMINI_FALLBACK_CONFIDENCE_THRESHOLD && conf > 0) lowConfidenceFields.push(name);
     };
-    checkField('productName', prodName);
-    checkField('brandName', brandNameVal);
-    checkField('genericCommodityName', genericCommodityNameVal);
+    checkField('productName', prodName, prodNameElem?.confidence);
+    checkField('brandName', brandNameVal, brandNameElem?.confidence);
+    checkField('genericCommodityName', genericCommodityNameVal, genericCommodityNameElem?.confidence);
     checkField('manufacturer.name', mfrName, mfrElem?.confidence);
     checkField('manufacturer.address', null); // addresses are always undetected in regex
     checkField('marketer.name', mktName);
+    checkField('mrp', mrpVal, mrpElem?.confidence);
     checkField('unitSalePrice', uspVal, uspElem?.confidence);
+    checkField('netQuantity', netQtyVal, netQtyElem?.confidence);
     checkField('countryOfOrigin', countryVal, countryElem?.confidence);
     checkField('consumerCare.phone', carePhone, carePhoneElem?.confidence);
     checkField('consumerCare.email', careEmail, careEmailElem?.confidence);
@@ -1511,10 +1522,17 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
         _singleExtractions: extractedList
     };
 
-    // Combine raw OCR elements
+    // Combine raw OCR elements and initialize merged declarations
     extractedList.forEach(ext => {
         if (Array.isArray(ext.rawOcrText)) {
             merged.rawOcrText.push(...ext.rawOcrText);
+        }
+        if (ext.declarations) {
+            Object.entries(ext.declarations).forEach(([k, decl]) => {
+                if (!merged.declarations[k] || (decl && decl.status === 'verified' && merged.declarations[k].status !== 'verified')) {
+                    merged.declarations[k] = { ...decl };
+                }
+            });
         }
     });
 
@@ -1730,6 +1748,27 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     // Phase 5 Fix 1 — Phase 2: Gemini Semantic Reconciliation
     // Only called for fields that couldn't be resolved by basic normalization
     // =========================================================================
+    // Phase 5 Accuracy Overhaul: High-stakes fields always eligible for verification (Finding 2)
+    const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
+    highStakesVerificationFields.forEach(f => {
+        if (!fieldsNeedingGemini[f]) {
+            const decl = merged.declarations?.[f];
+            const isUnverified = !decl || decl.status !== 'verified' || !decl.value;
+            // Also verify if brand matches marketer or product name matches brand
+            const isSuspicious = f === 'brandName' && merged.marketer?.name && merged.brandName &&
+                merged.brandName.toLowerCase().includes(merged.marketer.name.toLowerCase());
+            if (isUnverified || isSuspicious) {
+                const obs = extractedList.map((e, idx) => {
+                    const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
+                    return val ? { value: String(val), photoId: `Photo #${idx + 1}`, rawText: String(val) } : null;
+                }).filter(Boolean);
+                if (obs.length > 0) {
+                    fieldsNeedingGemini[f] = obs;
+                }
+            }
+        }
+    });
+
     if (Object.keys(fieldsNeedingGemini).length > 0 && geminiService.isAvailable()) {
         console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) need Gemini reconciliation:`, Object.keys(fieldsNeedingGemini));
         
@@ -1743,8 +1782,10 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                     
                     if (result.isConflict) {
                         // Gemini confirmed genuine conflict
-                        reconField.status = 'confirmed_conflict';
-                        reconField.geminiReasoning = result.reasoning;
+                        if (reconField) {
+                            reconField.status = 'confirmed_conflict';
+                            reconField.geminiReasoning = result.reasoning;
+                        }
                         
                         const conflictRecord = {
                             field: fieldName,
@@ -1759,10 +1800,12 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         merged.reconciliation.conflicts.push(conflictRecord);
                     } else {
                         // Gemini resolved the conflict — these are the same entity
-                        reconField.status = 'reconciled_gemini';
-                        reconField.resolvedValue = result.value;
-                        reconField.geminiReasoning = result.reasoning;
-                        reconField.reconciledFrom = fieldsNeedingGemini[fieldName];
+                        if (reconField) {
+                            reconField.status = 'reconciled_gemini';
+                            reconField.resolvedValue = result.value;
+                            reconField.geminiReasoning = result.reasoning;
+                            reconField.reconciledFrom = fieldsNeedingGemini[fieldName];
+                        }
                         
                         // Apply the reconciled value
                         const setterMap = {
@@ -1775,6 +1818,19 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         };
                         if (setterMap[fieldName]) {
                             setterMap[fieldName](merged, result.value);
+                            const declKey = fieldName.split('.')[0];
+                            if (merged.declarations && merged.declarations[declKey]) {
+                                if (fieldName.includes('.')) {
+                                    const sub = fieldName.split('.')[1];
+                                    if (typeof merged.declarations[declKey].value === 'object' && merged.declarations[declKey].value) {
+                                        merged.declarations[declKey].value[sub] = result.value;
+                                    }
+                                } else {
+                                    merged.declarations[declKey].value = result.value;
+                                }
+                                merged.declarations[declKey].status = 'verified';
+                                merged.declarations[declKey].source = 'gemini_reconciliation';
+                            }
                         }
                         
                         console.log(`[Reconciliation] ${fieldName}: Gemini reconciled to "${result.value}" — ${result.reasoning}`);
@@ -1782,17 +1838,55 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                 }
             }
 
-            // Apply brand classification (only fill in nulls — do not overwrite
-            // values that primary extraction already found)
+            // Finding 1: Apply brand classification with confidence-based overwrite policy
             if (geminiResult.brandClassification) {
                 const bc = geminiResult.brandClassification;
-                if (bc.brand && !merged.brandName) merged.brandName = bc.brand;
-                if (bc.productName && !merged.productName && !merged.conflicts.some(c => c.field === 'productName')) {
-                    merged.productName = bc.productName;
-                }
-                if (bc.genericName && !merged.genericCommodityName) merged.genericCommodityName = bc.genericName;
                 
-                console.log(`[Reconciliation] Brand classification: brand="${bc.brand}", product="${bc.productName}", generic="${bc.genericName}"`);
+                const canOverwriteIdentity = (fieldKey, currentVal) => {
+                    if (!currentVal) return true;
+                    const decl = merged.declarations?.[fieldKey];
+                    if (!decl || decl.status !== 'verified') return true;
+                    if (decl.confidence && decl.confidence < 0.85) return true;
+                    if (merged.conflicts?.some(c => c.field === fieldKey)) return true;
+                    // If brandName matches marketer name or is an obvious badge, allow overwrite
+                    if (fieldKey === 'brandName' && merged.marketer?.name &&
+                        String(currentVal).toLowerCase().includes(String(merged.marketer.name).toLowerCase())) {
+                        return true;
+                    }
+                    return false;
+                };
+
+                if (bc.brand && canOverwriteIdentity('brandName', merged.brandName)) {
+                    console.log(`[Reconciliation] Overwriting brandName: "${merged.brandName}" -> "${bc.brand}" via Gemini classification`);
+                    merged.brandName = bc.brand;
+                    if (!merged.declarations.brandName) merged.declarations.brandName = { value: null };
+                    merged.declarations.brandName.value = bc.brand;
+                    merged.declarations.brandName.source = 'gemini_reconciliation';
+                    merged.declarations.brandName.aiAssisted = true;
+                    merged.declarations.brandName.status = 'ai_assisted';
+                }
+
+                if (bc.productName && canOverwriteIdentity('productName', merged.productName)) {
+                    console.log(`[Reconciliation] Overwriting productName: "${merged.productName}" -> "${bc.productName}" via Gemini classification`);
+                    merged.productName = bc.productName;
+                    if (!merged.declarations.productName) merged.declarations.productName = { value: null };
+                    merged.declarations.productName.value = bc.productName;
+                    merged.declarations.productName.source = 'gemini_reconciliation';
+                    merged.declarations.productName.aiAssisted = true;
+                    merged.declarations.productName.status = 'ai_assisted';
+                }
+
+                if (bc.genericName && canOverwriteIdentity('genericCommodityName', merged.genericCommodityName)) {
+                    console.log(`[Reconciliation] Overwriting genericCommodityName: "${merged.genericCommodityName}" -> "${bc.genericName}" via Gemini classification`);
+                    merged.genericCommodityName = bc.genericName;
+                    if (!merged.declarations.genericCommodityName) merged.declarations.genericCommodityName = { value: null };
+                    merged.declarations.genericCommodityName.value = bc.genericName;
+                    merged.declarations.genericCommodityName.source = 'gemini_reconciliation';
+                    merged.declarations.genericCommodityName.aiAssisted = true;
+                    merged.declarations.genericCommodityName.status = 'ai_assisted';
+                }
+                
+                console.log(`[Reconciliation] Brand classification applied: brand="${merged.brandName}", product="${merged.productName}", generic="${merged.genericCommodityName}"`);
             }
         } catch (err) {
             console.error('[Reconciliation] Gemini reconciliation failed:', err.message);
@@ -1858,9 +1952,10 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
  * @returns {Promise<Object>} Updated mergedFields with fallback values applied
  */
 const applyGeminiFallback = async (mergedFields, images = []) => {
-    if (!geminiService.isAvailable() || images.length === 0) {
-        return mergedFields;
-    }
+    try {
+        if (!geminiService.isAvailable() || images.length === 0) {
+            return mergedFields;
+        }
 
     // Collect all low-confidence fields across all photos
     const allLowConf = new Set();
@@ -1872,19 +1967,29 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
         });
     }
     
-    // Also check merged result for not_detected fields
+    // Also check merged result for not_detected or unverified fields (Findings 3 & 4)
     const fieldsToCheck = [
+        { name: 'productName', val: mergedFields.productName },
+        { name: 'brandName', val: mergedFields.brandName },
+        { name: 'genericCommodityName', val: mergedFields.genericCommodityName },
+        { name: 'mrp', val: mergedFields.mrp?.value },
         { name: 'unitSalePrice', val: mergedFields.unitSalePrice },
+        { name: 'netQuantity', val: mergedFields.netQuantity?.value },
         { name: 'manufacturer.name', val: mergedFields.manufacturer?.name },
         { name: 'manufacturer.address', val: mergedFields.manufacturer?.address },
         { name: 'marketer.name', val: mergedFields.marketer?.name },
         { name: 'countryOfOrigin', val: mergedFields.countryOfOrigin },
         { name: 'consumerCare.phone', val: mergedFields.consumerCare?.phone },
-        { name: 'genericCommodityName', val: mergedFields.genericCommodityName },
+        { name: 'consumerCare.email', val: mergedFields.consumerCare?.email },
     ];
     
     fieldsToCheck.forEach(({ name, val }) => {
-        if (!val) allLowConf.add(name);
+        const declKey = name.split('.')[0];
+        const decl = mergedFields.declarations?.[declKey];
+        const isUnverified = !decl || decl.status !== 'verified';
+        if (!val || isUnverified) {
+            allLowConf.add(name);
+        }
     });
 
     const fieldsToRead = Array.from(allLowConf);
@@ -1894,77 +1999,126 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
 
     console.log(`[Gemini Fallback] Attempting to recover ${fieldsToRead.length} field(s):`, fieldsToRead);
 
-    // Use the first image for fallback (usually front of pack)
-    // Could be extended to try multiple images if first doesn't work
-    const primaryImage = images[0];
-    
-    try {
-        const fallbackResult = await geminiService.fallbackReadFields(
-            primaryImage.buffer,
-            fieldsToRead,
-            primaryImage.mimetype || 'image/jpeg'
-        );
-
-        if (fallbackResult.skipped || !fallbackResult.results) {
-            return mergedFields;
+    // Apply recovered values with AI-assisted provenance and confidence-based overwrite (Finding 1)
+    let recoveredCount = 0;
+    const applyFallback = (fieldPath, value, reasoning, sourcePhrase) => {
+        const parts = fieldPath.split('.');
+        let target = mergedFields;
+        for (let i = 0; i < parts.length - 1; i++) {
+            if (!target[parts[i]]) target[parts[i]] = {};
+            target = target[parts[i]];
         }
+        const lastKey = parts[parts.length - 1];
+        
+        const currentVal = target[lastKey];
+        const isFalsy = currentVal === null || currentVal === undefined || currentVal === '';
+        const isLowConf = allLowConf.has(fieldPath) || allLowConf.has(parts[0]);
+        const declKey = parts[0];
+        const decl = mergedFields.declarations?.[declKey];
+        const isUnverifiedDecl = !decl || decl.status !== 'verified';
+        const isConflict = mergedFields.conflicts?.some(c => c.field === fieldPath || c.field === declKey);
 
-        // Apply recovered values with AI-assisted provenance
-        const recovered = fallbackResult.results;
-        let recoveredCount = 0;
-
-        const applyFallback = (fieldPath, value, reasoning) => {
-            const parts = fieldPath.split('.');
-            let target = mergedFields;
-            for (let i = 0; i < parts.length - 1; i++) {
-                if (!target[parts[i]]) target[parts[i]] = {};
-                target = target[parts[i]];
-            }
-            const lastKey = parts[parts.length - 1];
-            
-            // Only apply if the field is currently empty
-            if (!target[lastKey]) {
-                target[lastKey] = value;
-                recoveredCount++;
-
-                // Update declarations if they exist
-                if (mergedFields.declarations) {
-                    const declKey = parts[0];
-                    if (mergedFields.declarations[declKey]) {
-                        if (parts.length > 1) {
-                            mergedFields.declarations[declKey][lastKey] = value;
-                        } else {
-                            mergedFields.declarations[declKey].value = value;
-                        }
-                        mergedFields.declarations[declKey].source = 'gemini_fallback';
-                        mergedFields.declarations[declKey].aiAssisted = true;
-                        mergedFields.declarations[declKey].status = 'ai_assisted';
+        // Overwrite policy: allow if falsy, low-confidence, unverified, or in conflict
+        if (isFalsy || isLowConf || isUnverifiedDecl || isConflict) {
+            // Grounding check for visual fallback (Finding 7)
+            let isGrounded = true;
+            if (sourcePhrase && typeof sourcePhrase === 'string' && sourcePhrase.trim().length > 0) {
+                const normPhrase = sourcePhrase.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
+                const allOcrText = (mergedFields.rawOcrText || []).map(r => r.text).join(' ').toLowerCase();
+                const words = normPhrase.split(/\s+/).filter(w => w.length > 2);
+                if (words.length > 0) {
+                    const matched = words.filter(w => allOcrText.includes(w));
+                    if (matched.length === 0) {
+                        console.warn(`[Gemini Fallback] Grounding check: sourcePhrase "${sourcePhrase}" for "${fieldPath}" not detected in OCR text`);
+                        isGrounded = false;
                     }
                 }
-
-                console.log(`[Gemini Fallback] Recovered ${fieldPath}: "${value}" — ${reasoning}`);
             }
-        };
 
-        for (const [field, data] of Object.entries(recovered)) {
-            // Phase 6 (Audit Fix): Validate Gemini output against expected schema
-            const validated = validateGeminiFieldResult(field, data);
-            if (validated) {
-                applyFallback(field, validated.value, validated.reasoning);
+            if (fieldPath === 'mrp') {
+                const numVal = parseFloat(String(value).replace(/[^0-9.]/g, ''));
+                if (!isNaN(numVal) && numVal > 0) {
+                    mergedFields.mrp = {
+                        value: numVal,
+                        currency: 'INR',
+                        inclusiveOfTaxes: reasoning ? /incl/i.test(reasoning) : true
+                    };
+                }
+            } else if (fieldPath === 'netQuantity') {
+                const nqm = String(value).match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
+                if (nqm) {
+                    mergedFields.netQuantity = {
+                        value: parseFloat(nqm[1]),
+                        unit: nqm[2].toLowerCase()
+                    };
+                }
             } else {
-                console.warn(`[Gemini Fallback] Rejected invalid result for "${field}":`, JSON.stringify(data));
+                target[lastKey] = value;
             }
+            recoveredCount++;
+
+            // Ensure declarations are updated in sync (Single Source of Truth)
+            if (!mergedFields.declarations) mergedFields.declarations = {};
+            if (!mergedFields.declarations[declKey]) {
+                mergedFields.declarations[declKey] = { value: null };
+            }
+            const d = mergedFields.declarations[declKey];
+            if (parts.length > 1) {
+                if (!d.value || typeof d.value !== 'object') d.value = {};
+                d.value[lastKey] = value;
+            } else {
+                d.value = value;
+            }
+            d.source = 'gemini_fallback';
+            d.aiAssisted = true;
+            d.status = isGrounded ? 'ai_assisted' : 'unverified';
+            d.needsReview = !isGrounded;
+
+            console.log(`[Gemini Fallback] Recovered ${fieldPath}: "${value}" (grounded=${isGrounded}) — ${reasoning}`);
+        } else {
+            console.log(`[Gemini Fallback] Preserved confident primary extraction for ${fieldPath}: "${currentVal}" (Gemini suggested "${value}")`);
         }
+    };
 
-        // Track fallback metadata
-        if (!mergedFields.geminiMetadata) mergedFields.geminiMetadata = {};
-        mergedFields.geminiMetadata.fallback = {
-            fieldsAttempted: fieldsToRead,
-            fieldsRecovered: Object.keys(recovered),
-            recoveredCount
-        };
+    // Try images to recover fields
+    const allRecovered = {};
+    for (let imgIdx = 0; imgIdx < Math.min(images.length, 3); imgIdx++) {
+        const remainingFields = fieldsToRead.filter(f => !allRecovered[f]);
+        if (remainingFields.length === 0) break;
 
-        console.log(`[Gemini Fallback] Recovered ${recoveredCount} of ${fieldsToRead.length} fields`);
+        const currentImage = images[imgIdx];
+        try {
+            const fallbackResult = await geminiService.fallbackReadFields(
+                currentImage.buffer,
+                remainingFields,
+                currentImage.mimetype || 'image/jpeg'
+            );
+
+            if (!fallbackResult.skipped && fallbackResult.results) {
+                for (const [field, data] of Object.entries(fallbackResult.results)) {
+                    const validated = validateGeminiFieldResult(field, data);
+                    if (validated) {
+                        applyFallback(field, validated.value, validated.reasoning, data.sourcePhrase);
+                        allRecovered[field] = validated;
+                    } else {
+                        console.warn(`[Gemini Fallback] Rejected invalid result for "${field}":`, JSON.stringify(data));
+                    }
+                }
+            }
+        } catch (imgErr) {
+            console.warn(`[Gemini Fallback] Error processing image #${imgIdx + 1}:`, imgErr.message);
+        }
+    }
+
+    // Track fallback metadata
+    if (!mergedFields.geminiMetadata) mergedFields.geminiMetadata = {};
+    mergedFields.geminiMetadata.fallback = {
+        fieldsAttempted: fieldsToRead,
+        fieldsRecovered: Object.keys(allRecovered),
+        recoveredCount
+    };
+
+    console.log(`[Gemini Fallback] Recovered ${recoveredCount} of ${fieldsToRead.length} fields across images`);
 
     } catch (err) {
         console.error('[Gemini Fallback] Error:', err.message);
