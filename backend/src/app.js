@@ -9,7 +9,9 @@ const { connectDB } = require('./config/db');
 connectDB();
 
 const app = express();
-const port = process.env.PORT || 5000;
+// Cloud Run injects PORT (default 8080). Support process.env.PORT with 8080 as fallback.
+const port = parseInt(process.env.PORT, 10) || 8080;
+const host = '0.0.0.0';
 
 // Phase 6 (Audit Fix): Configurable CORS origins via environment variable
 const corsOrigins = process.env.CORS_ORIGINS
@@ -27,6 +29,31 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Static uploads directory for local evidence storage fallback
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
+// Health check endpoints for Cloud Run / load balancers
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        service: 'DrishtiScan Backend API', 
+        timestamp: new Date().toISOString() 
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        message: 'DrishtiScan backend is running', 
+        timestamp: new Date().toISOString() 
+    });
+});
+
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        message: 'DrishtiScan backend is running', 
+        timestamp: new Date().toISOString() 
+    });
+});
+
 // Register Routes
 const authRoutes = require('./routes/authRoutes');
 const consumerRoutes = require('./routes/consumerRoutes');
@@ -39,14 +66,6 @@ app.use('/api/consumer', consumerRoutes);
 app.use('/api/officer', officerRoutes);
 app.use('/api/rules', ruleRoutes);
 app.use('/api/debug', debugRoutes);
-
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        message: 'DrishtiScan backend is running', 
-        timestamp: new Date().toISOString() 
-    });
-});
 
 // Phase 6 (Audit Fix): Global error-sanitizing middleware.
 // In production, strips stack traces and internal error details from responses.
@@ -63,7 +82,9 @@ app.use((err, req, res, _next) => {
     });
 });
 
-app.listen(port, () => {
-    console.log(`Backend server listening at http://localhost:${port}`);
+app.listen(port, host, () => {
+    console.log(`Backend server listening on ${host}:${port} (Cloud Run compatible)`);
     console.log(`CORS origins: ${corsOrigins.join(', ')}`);
 });
+
+module.exports = app;
