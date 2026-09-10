@@ -1,43 +1,63 @@
 import os
 import time
+import threading
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 import uvicorn
-from paddleocr import PaddleOCR
 import numpy as np
 import cv2
 
 app = FastAPI(title="DrishtiScan OCR Service")
 
 # =============================================================================
-# Fix 5 (Phase 5): Model is loaded ONCE at module level — not per request.
-# This was confirmed correct during Phase 5 debugging. Model weights (~750-815 MB)
-# are loaded into memory here and reused for every incoming /ocr request.
+# Fix 5 (Phase 5 + Cloud Run): Model is loaded ONCE via thread-safe singleton
+# and kept in memory for the lifetime of the process.
+# Model loading is initiated in background at startup so the HTTP server binds
+# to 0.0.0.0:PORT immediately within Cloud Run's startup window.
 # =============================================================================
-print("Initializing PaddleOCR...")
-try:
-    # use_textline_orientation handles angled text lines on cylindrical bottles
-    # cpu_threads=6 accelerates multi-core CPU inference
-    # enable_mkldnn=False prevents OneDNN PIR kernel conflicts in PaddlePaddle 3.3
-    # text_det_limit_side_len=2560: raised from default ~960 so large photos aren't
-    #   downscaled before small text is detected (Phase 5 Fix 4)
-    # text_rec_score_thresh=0.3: lowered from default ~0.5 so borderline-confidence
-    #   text isn't silently dropped — let extraction layer's confidence logic decide (Phase 5 Fix 4)
-    ocr = PaddleOCR(
-        use_textline_orientation=True,
-        lang='en',
-        enable_mkldnn=False,
-        cpu_threads=6,
-        text_det_limit_side_len=2560,
-        text_det_limit_type='max',
-        text_rec_score_thresh=0.3,
-    )
-    model_loaded = True
-    print("PaddleOCR initialized successfully with Phase 5 optimized settings.")
-except Exception as e:
-    print(f"Failed to load OCR model: {e}")
-    ocr = None
-    model_loaded = False
+ocr_model = None
+model_loaded = False
+model_loading = False
+model_lock = threading.Lock()
+
+def get_ocr():
+    """Thread-safe singleton getter for PaddleOCR.
+    Loads once on demand or via background startup thread, and reuses the model instance."""
+    global ocr_model, model_loaded, model_loading
+    if ocr_model is not None:
+        return ocr_model
+    with model_lock:
+        if ocr_model is not None:
+            return ocr_model
+        model_loading = True
+        print("Initializing PaddleOCR with Phase 5 optimized settings...")
+        try:
+            from paddleocr import PaddleOCR
+            # use_textline_orientation handles angled text lines on cylindrical bottles
+            # cpu_threads=6 accelerates multi-core CPU inference
+            # enable_mkldnn=False prevents OneDNN PIR kernel conflicts in PaddlePaddle 3.3
+            # text_det_limit_side_len=2560: raised from default ~960 so large photos aren't
+            #   downscaled before small text is detected (Phase 5 Fix 4)
+            # text_rec_score_thresh=0.3: lowered from default ~0.5 so borderline-confidence
+            #   text isn't silently dropped — let extraction layer's confidence logic decide (Phase 5 Fix 4)
+            ocr_model = PaddleOCR(
+                use_textline_orientation=True,
+                lang='en',
+                enable_mkldnn=False,
+                cpu_threads=6,
+                text_det_limit_side_len=2560,
+                text_det_limit_type='max',
+                text_rec_score_thresh=0.3,
+            )
+            model_loaded = True
+            print("PaddleOCR initialized successfully with Phase 5 optimized settings.")
+        except Exception as e:
+            print(f"Failed to load OCR model: {e}")
+            ocr_model = None
+            model_loaded = False
+        finally:
+            model_loading = False
+        return ocr_model
 
 # =============================================================================
 # Phase 5 Fix 4: CLAHE Contrast Enhancement
@@ -113,7 +133,10 @@ def create_tiles(img_h, img_w):
 
 def run_ocr_on_image(img):
     """Run PaddleOCR on a single image and return raw results dict."""
-    result = ocr.predict(img)
+    model = get_ocr()
+    if model is None:
+        return None
+    result = model.predict(img)
     if result and isinstance(result, list) and len(result) > 0:
         res_dict = result[0]
         if isinstance(res_dict, dict) and 'rec_texts' in res_dict and 'dt_polys' in res_dict:
@@ -201,15 +224,27 @@ async def startup_event():
     print("  - Detection side length limit: 2560")
     print("  - Recognition score threshold: 0.3 (lowered)")
     print(f"  - Tiling threshold: {TILE_THRESHOLD}px")
-    print("  - Model loaded once at startup: YES")
+    print("  - Model loaded in background worker: YES")
     print("="*50 + "\n")
+    # Initiate model warm-up in background thread so HTTP server binds port immediately
+    threading.Thread(target=get_ocr, daemon=True).start()
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "DrishtiScan OCR Microservice",
+        "engine": "PaddleOCR 3.7.0 (PP-OCRv6)",
+        "ocr_model_loaded": model_loaded
+    }
 
 @app.get("/health")
 def health_check():
     return {
-        "status": "ok" if model_loaded else "error",
-        "ocrEngine": "PaddleOCR",
-        "model": "PP-OCRv6 Medium",
+        "status": "healthy" if model_loaded else "initializing",
+        "ocr_model_loaded": model_loaded,
+        "ocr_model_loading": model_loading,
+        "engine": "PaddleOCR 3.7.0 (PP-OCRv6)",
         "device": "CPU",
         "cpuThreads": 6,
         "phase5Enhancements": {
@@ -222,23 +257,25 @@ def health_check():
     }
 
 @app.get("/tips")
-def capture_tips():
-    """Phase 5 Fix 4: Capture quality guidance for officer/consumer capture screens."""
+def get_capture_tips():
+    """Phase 5 Fix 4: Capture guidance tips for packaging label photography."""
     return {
         "tips": [
-            "Avoid direct flash glare \u2014 use ambient or angled lighting",
-            "Hold the camera steady to prevent motion blur",
-            "Fill the frame with one panel at a time (front, back, side)",
-            "For cylindrical bottles, flatten the label by rotating the product slightly",
-            "Ensure text is in focus \u2014 tap to focus on the label area",
-            "Photograph each side of the package separately for best accuracy"
-        ]
+            "Avoid direct flash glare on glossy bottles or laminate pouches.",
+            "Hold camera steady to avoid motion blur on fine text.",
+            "Fill the frame with one panel at a time (front, ingredients, nutritional table).",
+            "Ensure label text is reasonably horizontal before photographing.",
+            "For curved or cylindrical bottles, capture multiple overlapping photos from different angles."
+        ],
+        "recommended_min_resolution": "1080p",
+        "optimal_lighting": "Diffused daylight or soft indoor lighting"
     }
 
 @app.post("/ocr")
 async def perform_ocr(image: UploadFile = File(...)):
-    if not model_loaded:
-        return JSONResponse(status_code=500, content={"error": "OCR model failed to load"})
+    model = get_ocr()
+    if model is None:
+        return JSONResponse(status_code=503, content={"error": "OCR model is currently initializing or unavailable"})
 
     # Read image into OpenCV format
     contents = await image.read()
@@ -281,7 +318,7 @@ async def perform_ocr(image: UploadFile = File(...)):
             proc_img = enhanced_img
 
         # Run PaddleOCR
-        result = ocr.predict(proc_img)
+        result = model.predict(proc_img)
 
         formatted_results = []
 
@@ -324,37 +361,6 @@ async def perform_ocr(image: UploadFile = File(...)):
             "recScoreThresh": 0.3
         },
         "results": formatted_results
-    }
-
-@app.get("/tips")
-def get_capture_tips():
-    """Phase 5 Fix 4: Capture guidance tips for packaging label photography."""
-    return {
-        "tips": [
-            "Avoid direct flash glare on glossy bottles or laminate pouches.",
-            "Hold camera steady to avoid motion blur on fine text.",
-            "Fill the frame with one panel at a time (front, ingredients, nutritional table).",
-            "Ensure label text is reasonably horizontal before photographing.",
-            "For curved or cylindrical bottles, capture multiple overlapping photos from different angles."
-        ],
-        "recommended_min_resolution": "1080p",
-        "optimal_lighting": "Diffused daylight or soft indoor lighting"
-    }
-
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "DrishtiScan OCR Microservice",
-        "engine": "PaddleOCR 3.7.0 (PP-OCRv6)"
-    }
-
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "ocr_model_loaded": model_loaded,
-        "engine": "PaddleOCR 3.7.0 (PP-OCRv6)"
     }
 
 if __name__ == "__main__":

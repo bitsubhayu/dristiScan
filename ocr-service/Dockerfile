@@ -15,6 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download and cache PaddleOCR models during Docker build into /root/.paddlex
+# This eliminates cold network downloads at container startup
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_textline_orientation=True, lang='en', enable_mkldnn=False)"
+
 # Copy application code
 COPY . .
 
