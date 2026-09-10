@@ -1,0 +1,180 @@
+{
+  "TEST_A": {
+    "passed": true,
+    "details": {
+      "summary": "No Haldiram data; supplement bottle fields accurate; zero false conflicts",
+      "mrp": 666,
+      "batch": "ONFO26005",
+      "mfg": "MAY 2026",
+      "exp": "NOV 2027",
+      "conflicts": []
+    }
+  },
+  "TEST_B": {
+    "passed": true,
+    "details": {
+      "summary": "Zero leakage from TEST A or Haldiram data",
+      "productName": "©2014 THE COCA-COLA"
+    }
+  },
+  "TEST_C": {
+    "passed": true,
+    "details": {
+      "summary": "Complementary valid fields merged; servingsPerContainer (60) kept separate; netQuantity is NOT 60 servings; zero false conflicts",
+      "servingsPerContainer": 60,
+      "servingSize": "1 Capsule (Approx. 1.425g) ALLERGENSCON Quantity Per Serving % RDA Processedes Energy 10.54 kcal are man Protein 0.5% 0.29g RECOMMENGED Carbohydrate^ 0.6% 0.09g To fine ot one Total Sugars^ vist DPM -Added Sugars 0g 0g For Fec Total Fat 1.00g 0% 1.5% Customer Cirn -Saturated Fatty Acid 0.38g -Monounsaturated Fatty Acids^ 0.26g 1.7% +91-11-49 -Polyunsaturated Fatty Acids^ 0.36g -Trans Fat 0g Cholesterol^ 7.70 mg 0% Sodlum 0mg 0% Fish Oll^ 1000 mg -Elcosapentaenoic Acid (EPA)^ 180 mg -Docosahexaenoic Acid (DHA)^ 120 mg Batch No: Mfg. Date ELS Council of Medical Research Guideline 2020 Percent RDA not established Exp. Date: MRP (incl. of 1ND all taxes) RACEUTICAL Rs. per SKIN AND capsule: 07751 48927\"07043 PKD on BOSERVINGS",
+      "netQuantity": {
+        "value": null,
+        "unit": null
+      },
+      "mrp": 666,
+      "batch": "ONFO26005",
+      "conflicts": []
+    }
+  },
+  "TEST_D": {
+    "passed": true,
+    "details": {
+      "summary": "No prior scan data survives into fresh scan"
+    }
+  },
+  "TEST_E": {
+    "passed": true,
+    "details": {
+      "summary": "Unreadable image safely returned null fields and status: INSUFFICIENT_EVIDENCE (NOT PASS)",
+      "overallStatus": "INSUFFICIENT_EVIDENCE",
+      "productName": null,
+      "mrp": null
+    }
+  },
+  "TEST_F": {
+    "passed": true,
+    "details": {
+      "summary": "Ingredients correctly categorized; no false cross-angle product name conflict",
+      "productName": "Fish Oil 1000 mg",
+      "ingredients": "Fish Oil, Gelling Agent (INS 4201)",
+      "conflicts": []
+    }
+  },
+  "TEST_G": {
+    "passed": true,
+    "details": {
+      "summary": "Genuine MRP conflict detected (666 vs 699), status set to POTENTIAL_NON_COMPLIANCE",
+      "conflicts": [
+        {
+          "field": "mrp",
+          "detectedValues": [
+            {
+              "photo": "Photo #1",
+              "value": "666"
+            },
+            {
+              "photo": "Photo #2",
+              "value": "699"
+            }
+          ],
+          "message": "Confirmed conflict: Genuine numerical discrepancy (666 vs 699)",
+          "confirmedByGemini": true
+        }
+      ],
+      "overallStatus": "POTENTIAL_NON_COMPLIANCE"
+    }
+  },
+  "TEST_H": {
+    "passed": true,
+    "details": {
+      "summary": "servingsPerContainer = 60, servingSize = 1 Capsule, netQuantity remains null",
+      "servingsPerContainer": 60,
+      "servingSize": "1 Capsule (Approx. 1.425 g)",
+      "netQuantity": {
+        "value": null,
+        "unit": null
+      }
+    }
+  },
+  "TEST_I": {
+    "passed": true,
+    "details": {
+      "summary": "Field absent from angle 2 cleanly resolved without conflict as single_verified_observation",
+      "mrp": 666,
+      "reconciliationStatus": "single_verified_observation"
+    }
+  },
+  "TEST_J": {
+    "passed": true,
+    "details": {
+      "summary": "Identical MRP on both angles reconciled as consistent without conflict",
+      "reconciliationStatus": "consistent",
+      "mrp": 666
+    }
+  },
+  "TEST_K": {
+    "passed": true,
+    "details": {
+      "summary": "Each number strictly remained in its designated semantic category",
+      "phone": "+9111495949",
+      "fssai": "10012011000123",
+      "batch": "ONFO26005",
+      "mrp": 666
+    }
+  },
+  "TEST_L": {
+    "passed": true,
+    "details": {
+      "summary": "Country resolved as \"India\" without FSSAI text; FSSAI captured exactly",
+      "country": "India",
+      "fssai": "10012011000123"
+    }
+  },
+  "TEST_M": {
+    "passed": true,
+    "details": {
+      "summary": "Manufacturer, marketer, and importer successfully separated",
+      "manufacturer": "ABC Nutrition Laboratories Pvt Ltd",
+      "marketer": "XYZ Wellness Enterprises Ltd",
+      "importer": "Global Supplements Trade Co"
+    }
+  },
+  "TEST_N": {
+    "passed": true,
+    "details": {
+      "summary": "Mfg date, expiry date, and best before correctly assigned without swapping",
+      "dates": {
+        "manufacture": "MAY 2026",
+        "expiry": "NOV 2027",
+        "bestBefore": "24 months from packaging"
+      }
+    }
+  },
+  "TEST_O": {
+    "passed": true,
+    "details": {
+      "summary": "Real OCR on bottle_1.jpeg yielded status: INSUFFICIENT_EVIDENCE for missing MRP (zero fabricated value, NOT PASS)",
+      "overallStatus": "INSUFFICIENT_EVIDENCE",
+      "mrp": null
+    }
+  },
+  "TEST_P": {
+    "passed": true,
+    "details": {
+      "summary": "Curved packaging text detected with full bbox and confidence evidence (72 elements)"
+    }
+  },
+  "TEST_Q": {
+    "passed": true,
+    "details": {
+      "summary": "Concurrent requests executed simultaneously with complete data isolation",
+      "scanId1": "scan_1788800148002_1da99e",
+      "scanId2": "scan_1788800148000_b92b4b"
+    }
+  },
+  "TEST_R": {
+    "passed": true,
+    "details": {
+      "summary": "PDF (6742 bytes) and DOCX (11506 bytes) generated matching canonical compliance result",
+      "pdfSize": 6742,
+      "docxSize": 11506,
+      "overallStatus": "INSUFFICIENT_EVIDENCE"
+    }
+  }
+}

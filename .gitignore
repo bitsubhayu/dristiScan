@@ -1,0 +1,71 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Node dependencies and build
+node_modules/
+**/node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Python virtual environments & bytecode
+.venv/
+**/.venv/
+.venv*/
+**/.venv*/
+python311/
+**/python311/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Log files
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+ocr-service/output.txt
+ocr-service/output.log
+ocr-service/trace*.log
+ocr-service/=3.7.0
+
+# Generated runtime data and uploads
+backend/uploads/
+backend/debug_scans/
+backend/reports/
+backend/test_downloads/
+uploads/
+
+# IDE / OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.agents/

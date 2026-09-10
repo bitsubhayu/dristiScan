@@ -1,0 +1,116 @@
+[
+  {
+    "id": "TEST_8",
+    "name": "Performance Check (Model loaded once at startup)",
+    "passed": true,
+    "details": {
+      "perImageTimes": [
+        {
+          "filename": "bottle_1.jpeg",
+          "elapsedMs": 27570,
+          "elements": 72
+        },
+        {
+          "filename": "bottle_2.jpeg",
+          "elapsedMs": 14325,
+          "elements": 23
+        },
+        {
+          "filename": "bottle_3.jpg",
+          "elapsedMs": 15258,
+          "elements": 52
+        }
+      ],
+      "totalTimeMs": 57153,
+      "finding": "PaddleOCR is loaded once at module level in app.py line 26; model weights cached in RAM. No per-request re-initialization."
+    }
+  },
+  {
+    "id": "TEST_1",
+    "name": "Optimum Nutrition Multi-Photo Reconciliation (Fix 1)",
+    "passed": true,
+    "details": {
+      "productName": "Fish Oil",
+      "brandName": "Optimum Nutrition",
+      "genericName": "Fish Oil Dietary Supplement Softgels",
+      "conflicts": [],
+      "hasFalseProductConflict": false,
+      "overallStatus": "INSUFFICIENT_EVIDENCE",
+      "summary": "Success: No false product name conflict generated across angles."
+    }
+  },
+  {
+    "id": "TEST_2",
+    "name": "Negative Control (Real conflict detected when mixing different products)",
+    "passed": true,
+    "details": {
+      "conflictsFound": [
+        {
+          "field": "productName",
+          "message": "Confirmed conflict: Genuine conflict: different products detected across photos"
+        }
+      ],
+      "overallStatus": "POTENTIAL_NON_COMPLIANCE",
+      "passed": true
+    }
+  },
+  {
+    "id": "TEST_3",
+    "name": "Unit Sale Price (13.99) extraction via spatial pairing or fallback",
+    "passed": true,
+    "details": {
+      "unitSalePrice": "Rs. 11.10 / Cap",
+      "source": "paddleocr_primary",
+      "aiAssisted": false
+    }
+  },
+  {
+    "id": "TEST_4",
+    "name": "Manufacturer / Marketer declaration extraction",
+    "passed": true,
+    "details": {
+      "manufacturer": {
+        "name": "Tirupati Lifesciences Pvt. Ltd.",
+        "address": "Nahan Road, Paonta Sahib, Dist. Sirmour (H.P.) - 173025"
+      },
+      "marketer": {
+        "name": "Glanbia Performance Nutrition India Pvt. Ltd.",
+        "address": null
+      },
+      "found": true
+    }
+  },
+  {
+    "id": "TEST_5",
+    "name": "Blank/Unreadable image produces INSUFFICIENT_EVIDENCE (Never PASS)",
+    "passed": true,
+    "details": {
+      "overallStatus": "INSUFFICIENT_EVIDENCE",
+      "findingsCount": 11,
+      "neverPass": true
+    }
+  },
+  {
+    "id": "TEST_6",
+    "name": "Cross-scan data isolation (No residual global state contamination)",
+    "passed": true,
+    "details": {
+      "scan1Mrp": null,
+      "scan2Mrp": 999,
+      "scan3Mrp": null,
+      "isolationPreserved": true
+    }
+  },
+  {
+    "id": "TEST_7",
+    "name": "Curved-Surface Accuracy & Preprocessing (Fix 4)",
+    "passed": true,
+    "details": {
+      "claheApplied": true,
+      "textDetLimitSideLen": 2560,
+      "textRecScoreThresh": 0.3,
+      "useTextlineOrientation": true,
+      "captureGuidanceEndpoint": "/tips active and returning guidance"
+    }
+  }
+]

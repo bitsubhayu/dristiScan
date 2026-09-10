@@ -1,0 +1,72 @@
+[
+    {
+        "ruleCode": "LM-NETQTY-001",
+        "field": "netQuantity",
+        "category": "packaged_food_general",
+        "description": "The net quantity should be clearly declared on the package.",
+        "validation": {
+            "type": "presence",
+            "params": {}
+        },
+        "effectiveFrom": "2011-01-01",
+        "effectiveTo": null,
+        "sourceReference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(1)(d)",
+        "severity": "high"
+    },
+    {
+        "ruleCode": "LM-MRP-001",
+        "field": "mrp",
+        "category": "packaged_food_general",
+        "description": "MRP must be present and inclusive of all taxes.",
+        "validation": {
+            "type": "presence",
+            "params": {}
+        },
+        "effectiveFrom": "2011-01-01",
+        "effectiveTo": null,
+        "sourceReference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(1)(e)",
+        "severity": "high"
+    },
+    {
+        "ruleCode": "LM-MFG-001",
+        "field": "manufacturer",
+        "category": "packaged_food_general",
+        "description": "Name and address of the manufacturer or packer must be declared.",
+        "validation": {
+            "type": "presence",
+            "params": {}
+        },
+        "effectiveFrom": "2011-01-01",
+        "effectiveTo": null,
+        "sourceReference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(1)(a)",
+        "severity": "high"
+    },
+    {
+        "ruleCode": "LM-DATE-001",
+        "field": "dates",
+        "category": "packaged_food_general",
+        "description": "Month and year of manufacture or pre-packing must be present.",
+        "validation": {
+            "type": "presence",
+            "params": {}
+        },
+        "effectiveFrom": "2011-01-01",
+        "effectiveTo": null,
+        "sourceReference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(1)(f)",
+        "severity": "medium"
+    },
+    {
+        "ruleCode": "LM-CARE-001",
+        "field": "consumerCare",
+        "category": "packaged_food_general",
+        "description": "Consumer care details (name/designation, address, phone, email) must be declared.",
+        "validation": {
+            "type": "presence",
+            "params": {}
+        },
+        "effectiveFrom": "2011-01-01",
+        "effectiveTo": null,
+        "sourceReference": "Legal Metrology (Packaged Commodities) Rules, 2011 - Rule 6(2)",
+        "severity": "medium"
+    }
+]
