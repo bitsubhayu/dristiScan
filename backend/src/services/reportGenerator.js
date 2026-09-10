@@ -173,20 +173,25 @@ const generatePDF = async (reportData) => {
                 doc.y = thY + 20;
 
                 findings.forEach((f, idx) => {
-                    if (doc.y > 720) {
+                    const hasNote = Boolean(f.systemNote);
+                    const rowHeight = hasNote ? 30 : 20;
+                    if (doc.y + rowHeight > 720) {
                         doc.addPage();
                     }
                     const rowY = doc.y;
-                    const fColor = f.status === 'PASS' ? PASS_COLOR : (f.status === 'POTENTIAL_NON_COMPLIANCE' ? FAIL_COLOR : SECONDARY);
+                    const fColor = f.status === 'PASS' ? PASS_COLOR : (f.status === 'POTENTIAL_NON_COMPLIANCE' || f.status === 'FAIL' ? FAIL_COLOR : (f.status === 'REVIEW' ? WARN_COLOR : SECONDARY));
                     const rowBg = idx % 2 === 0 ? '#FFFFFF' : BG_LIGHT;
                     
-                    doc.rect(40, rowY, 515, 20).fill(rowBg);
+                    doc.rect(40, rowY, 515, rowHeight).fill(rowBg);
                     doc.fillColor(PRIMARY).fontSize(8).font('Helvetica').text(f.ruleCode || 'PCR-GEN', 45, rowY + 5, { width: 75 });
                     doc.text(f.field || 'General', 125, rowY + 5, { width: 85 });
                     doc.fillColor(fColor).font('Helvetica-Bold').text(f.status || 'N/A', 215, rowY + 5, { width: 75 });
                     doc.fillColor(PRIMARY).font('Helvetica').text(f.reason || f.extractedValue || 'Compliant', 295, rowY + 5, { width: 155 });
                     doc.fillColor(SECONDARY).fontSize(7.5).text(f.sourceReference || 'PCR 2011, R.6', 455, rowY + 5, { width: 95 });
-                    doc.y = rowY + 20;
+                    if (hasNote) {
+                        doc.fillColor(WARN_COLOR).fontSize(6.8).font('Helvetica-Oblique').text(`Officer Note: ${f.systemNote}`, 295, rowY + 18, { width: 250 });
+                    }
+                    doc.y = rowY + rowHeight;
                 });
             }
 

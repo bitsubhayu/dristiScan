@@ -40,6 +40,29 @@ const getClient = () => {
 };
 
 /**
+ * Execute Gemini API calls with exponential backoff for transient errors (503/429)
+ */
+const generateWithRetry = async (client, params, maxRetries = 2) => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+        try {
+            return await client.models.generateContent(params);
+        } catch (err) {
+            lastError = err;
+            const isTransient = /503|429|demand|rate|temporar|timeout/i.test(err.message || '');
+            if (isTransient && attempt <= maxRetries) {
+                const delayMs = attempt * 1500;
+                console.warn(`[GeminiService] Transient error (attempt ${attempt}/${maxRetries + 1}), retrying in ${delayMs}ms:`, err.message);
+                await new Promise(res => setTimeout(res, delayMs));
+            } else {
+                throw err;
+            }
+        }
+    }
+    throw lastError;
+};
+
+/**
  * Intelligent local reconciliation engine used when GEMINI_API_KEY is not configured.
  * Implements semantic reconciliation, fragment filtering, and brand classification.
  */
@@ -153,40 +176,44 @@ const localFallbackReadFields = (imageBuffer, fieldsToRead = []) => {
  * @param {Object} candidatesByField - Map of { fieldName: [{ value, photoId, rawText }] }
  * @returns {Object} { reconciledFields: { [fieldName]: { value, reasoning, isConflict } }, brandClassification: { brand, productName, genericName } }
  */
-const reconcileFields = async (candidatesByField) => {
+const reconcileFields = async (candidatesByField, allOcrFragments = []) => {
     const client = getClient();
     if (!client) {
         // Use local fallback reconciliation when no API key is present
         return localReconcileFields(candidatesByField);
     }
 
-    // Build the prompt — one batched call for all fields needing reconciliation
-    const fieldEntries = Object.entries(candidatesByField).filter(([, candidates]) => candidates.length > 1);
+    const fieldEntries = Object.entries(candidatesByField || {});
     
-    if (fieldEntries.length === 0) {
+    // Collect all text fragments for brand classification
+    const allTextFragments = [...(allOcrFragments || [])];
+    for (const [, candidates] of fieldEntries) {
+        if (Array.isArray(candidates)) {
+            for (const c of candidates) {
+                if (c && c.value) allTextFragments.push(c.value);
+                if (c && c.rawText && c.rawText !== c.value) allTextFragments.push(c.rawText);
+            }
+        }
+    }
+
+    if (fieldEntries.length === 0 && allTextFragments.length === 0) {
         return { reconciledFields: {}, brandClassification: null, skipped: false };
     }
 
     const fieldDescriptions = fieldEntries.map(([fieldName, candidates]) => {
+        if (!candidates || candidates.length === 0 || (candidates.length === 1 && !candidates[0].value)) {
+            return `Field "${fieldName}": (not detected by first pass)`;
+        }
         const candidateList = candidates.map(c => `  - ${c.photoId}: "${c.value}" (raw: "${c.rawText || c.value}")`).join('\n');
         return `Field "${fieldName}":\n${candidateList}`;
     }).join('\n\n');
 
-    // Collect all text fragments for brand classification
-    const allTextFragments = [];
-    for (const [, candidates] of fieldEntries) {
-        for (const c of candidates) {
-            allTextFragments.push(c.value);
-            if (c.rawText && c.rawText !== c.value) allTextFragments.push(c.rawText);
-        }
-    }
-
-    const prompt = `You are a product label analysis assistant. Multiple photos were taken of a SINGLE physical product package from different angles. The OCR system extracted different text fragments from each photo for the same fields.
+    const prompt = `You are a product label analysis assistant. Photos were taken of a physical product package. The OCR system extracted text fragments for various declarations.
 
 IMPORTANT FIELD DEFINITIONS — these are THREE SEPARATE identity declarations, not competing answers:
-- brandName: The company/manufacturer trade name (e.g. "NUTRABOX", "Optimum Nutrition"). This is the brand, NOT the product.
-- productName: The specific product or variant name (e.g. "The Alpha Creatine (Unflavoured)", "Gold Standard 100% Whey"). This is the marketing name of this specific product.
-- genericCommodityName: The common/generic name of the commodity as required by Legal Metrology (e.g. "Micronized Creatine Monohydrate", "Whey Protein Isolate", "Tomato Ketchup"). This is what the product IS, generically.
+- brandName: The company/manufacturer trade name (e.g. "NUTRABOX", "Optimum Nutrition", "Nestle"). This is the brand, NOT the product.
+- productName: The specific product or variant name (e.g. "The Alpha Creatine (Unflavoured)", "Gold Standard 100% Whey", "Maggi 2-Minute Noodles"). This is the marketing name of this specific product.
+- genericCommodityName: The common/generic name of the commodity as required by Legal Metrology (e.g. "Micronized Creatine Monohydrate", "Whey Protein Isolate", "Instant Noodles"). This is what the product IS, generically.
 
 All three can legitimately be different — they are NOT conflicts with each other.
 
@@ -195,9 +222,10 @@ For each field below, determine:
 2. OR whether they genuinely CONFLICT (e.g., two completely different products, two clearly different prices). If so, flag as a conflict.
 
 EXCLUSION RULES:
-- Websites/URLs containing the brand name (e.g., "OPTIMUMNUTRITION.CO.IN" for brand "Optimum Nutrition"), partial OCR fragments of the brand, and marketing text containing the brand are NOT conflicts.
-- Marketing/quality badges ("100% Authentic", "Certified", "Premium", "NUTHENTIC", "ISO Certified", "GMP") are NOT valid candidates for any identity field.
+- Websites/URLs containing the brand name, partial OCR fragments of the brand, and marketing text containing the brand are NOT conflicts.
+- Marketing/quality badges ("100% Authentic", "Certified", "Premium", "ISO Certified", "GMP", "Laboratory Tested") are NOT valid candidates for any identity field.
 - Ingredient list text, nutrition table text, and composition percentages must NEVER appear in netQuantity, productName, brandName, or genericCommodityName fields.
+- Dates or date-shaped strings (e.g., "13/05/2028", "EXP 2026") must NEVER appear in productName, brandName, or genericCommodityName.
 - If a field's value cannot be confidently determined, return null rather than guessing from nearby unrelated text.
 
 ${fieldDescriptions}
@@ -223,7 +251,7 @@ Respond in this exact JSON format (no markdown, no code fences):
 }`;
 
     try {
-        const response = await client.models.generateContent({
+        const response = await generateWithRetry(client, {
             model: GEMINI_MODEL,
             contents: prompt,
             config: {
@@ -343,7 +371,7 @@ Respond in this exact JSON format (no markdown, no code fences):
         // Convert image buffer to base64 for Gemini multimodal input
         const base64Image = imageBuffer.toString('base64');
 
-        const response = await client.models.generateContent({
+        const response = await generateWithRetry(client, {
             model: GEMINI_MODEL,
             contents: [
                 {

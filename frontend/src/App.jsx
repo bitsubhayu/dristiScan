@@ -1119,7 +1119,14 @@ function OfficerScanView({ user, onNavigateToRepo }) {
                             {f.status}
                           </span>
                         </td>
-                        <td>{sanitizeText(f.reason || f.extractedValue, 'Compliant with standards')}</td>
+                        <td>
+                          <div>{sanitizeText(f.reason || f.extractedValue, 'Compliant with standards')}</div>
+                          {f.systemNote && (
+                            <div style={{ fontSize: '0.75rem', color: '#d97706', marginTop: '4px', fontStyle: 'italic' }}>
+                              ⚠️ {f.systemNote}
+                            </div>
+                          )}
+                        </td>
                         <td style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{sanitizeText(f.sourceReference || 'PCR 2011, Rule 6')}</td>
                       </tr>
                     );
@@ -1548,7 +1555,14 @@ function OfficerRepositoryView({ user }) {
                       <td>
                         <span className={`status-chip ${f.status === 'PASS' ? 'pass' : 'fail'}`}>{f.status}</span>
                       </td>
-                      <td>{f.reason || f.extractedValue}</td>
+                      <td>
+                        <div>{f.reason || f.extractedValue}</div>
+                        {f.systemNote && (
+                          <div style={{ fontSize: '0.75rem', color: '#d97706', marginTop: '4px', fontStyle: 'italic' }}>
+                            ⚠️ {f.systemNote}
+                          </div>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

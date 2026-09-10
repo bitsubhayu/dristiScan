@@ -1,4 +1,5 @@
 const Rule = require('../models/Rule');
+const { validateFieldFormat, isValidQuantityUnit } = require('./extraction');
 
 /**
  * Evaluates extracted package declarations against Legal Metrology Rules (2011 + Amendments).
@@ -185,29 +186,36 @@ const evaluateRules = async (extracted) => {
             const servingSize = fields.servingSize;
 
             if (nq && nq.value !== null && nq.unit !== null) {
-                status = 'PASS';
-                extractedValue = `${nq.value} ${nq.unit}`;
-                reason = `Net quantity declared in standard metric units: ${nq.value} ${nq.unit}`;
+                const isUnitValid = isValidQuantityUnit(nq.unit);
+                if (!isUnitValid) {
+                    status = 'POTENTIAL_NON_COMPLIANCE';
+                    extractedValue = `${nq.value} ${nq.unit}`;
+                    reason = `Net quantity declaration uses unrecognized or non-standard unit: "${nq.unit}". Metric mass/volume or standard count units required.`;
+                } else {
+                    status = 'PASS';
+                    extractedValue = `${nq.value} ${nq.unit}`;
+                    reason = `Net quantity declared in standard metric/count units: ${nq.value} ${nq.unit}`;
 
-                // Cross-field arithmetic validation: netQuantity vs servingSize & servingsPerContainer
-                if (servings !== null && servings !== undefined) {
-                    let servingSizeNum = null;
-                    if (typeof servingSize === 'number') {
-                        servingSizeNum = servingSize;
-                    } else if (typeof servingSize === 'string') {
-                        const m = servingSize.match(/(\d+(?:\.\d+)?)/);
-                        if (m) servingSizeNum = parseFloat(m[1]);
-                    }
+                    // Cross-field arithmetic validation: netQuantity vs servingSize & servingsPerContainer
+                    if (servings !== null && servings !== undefined) {
+                        let servingSizeNum = null;
+                        if (typeof servingSize === 'number') {
+                            servingSizeNum = servingSize;
+                        } else if (typeof servingSize === 'string') {
+                            const m = servingSize.match(/(\d+(?:\.\d+)?)/);
+                            if (m) servingSizeNum = parseFloat(m[1]);
+                        }
 
-                    if (servingSizeNum && servingSizeNum > 0 && ['g', 'ml'].includes((nq.unit || '').toLowerCase())) {
-                        const expectedServings = nq.value / servingSizeNum;
-                        const ratio = servings / expectedServings;
-                        // Discrepancy > 25% (i.e. ratio < 0.75 or ratio > 1.25)
-                        if (ratio < 0.75 || ratio > 1.25) {
-                            status = 'REVIEW';
-                            reason = `Discrepancy detected: Servings per container (${servings}) does not match net quantity (${nq.value}${nq.unit}) / serving size (${servingSizeNum}g) = ~${Math.round(expectedServings)} expected servings.`;
-                        } else {
-                            reason += ` (Plausibility verified: ${nq.value}${nq.unit} ÷ ${servingSizeNum}g ≈ ${Math.round(expectedServings)} servings, matching declared ${servings})`;
+                        if (servingSizeNum && servingSizeNum > 0 && ['g', 'ml'].includes((nq.unit || '').toLowerCase())) {
+                            const expectedServings = nq.value / servingSizeNum;
+                            const ratio = servings / expectedServings;
+                            // Discrepancy > 25% (i.e. ratio < 0.75 or ratio > 1.25)
+                            if (ratio < 0.75 || ratio > 1.25) {
+                                status = 'REVIEW';
+                                reason = `Discrepancy detected: Servings per container (${servings}) does not match net quantity (${nq.value}${nq.unit}) / serving size (${servingSizeNum}g) = ~${Math.round(expectedServings)} expected servings.`;
+                            } else {
+                                reason += ` (Plausibility verified: ${nq.value}${nq.unit} ÷ ${servingSizeNum}g ≈ ${Math.round(expectedServings)} servings, matching declared ${servings})`;
+                            }
                         }
                     }
                 }
@@ -225,7 +233,12 @@ const evaluateRules = async (extracted) => {
             // Maximum Retail Price
             const mrp = fields.mrp;
             if (mrp && mrp.value !== null) {
-                if (mrp.inclusiveOfTaxes) {
+                const mrpCheck = validateFieldFormat('mrp', mrp.value);
+                if (!mrpCheck.valid) {
+                    status = 'POTENTIAL_NON_COMPLIANCE';
+                    extractedValue = `₹${mrp.value}`;
+                    reason = `MRP does not conform to valid numeric currency format: "${mrp.value}" (${mrpCheck.reason}).`;
+                } else if (mrp.inclusiveOfTaxes) {
                     status = 'PASS';
                     extractedValue = `₹${mrp.value} (Inclusive of all taxes)`;
                     reason = `MRP declared compliant with tax inclusion statement.`;
@@ -245,23 +258,30 @@ const evaluateRules = async (extracted) => {
             const mfg = fields.dates?.manufacture;
             const exp = fields.dates?.expiry || fields.dates?.bestBefore;
             if (mfg) {
-                status = 'PASS';
-                extractedValue = mfg;
-                reason = `Manufacturing / packing date declared: ${mfg}`;
+                const mfgCheck = validateFieldFormat('dates.manufacture', mfg);
+                if (!mfgCheck.valid) {
+                    status = 'POTENTIAL_NON_COMPLIANCE';
+                    extractedValue = mfg;
+                    reason = `Manufacturing date declaration does not conform to real calendar date format: "${mfg}" (${mfgCheck.reason}).`;
+                } else {
+                    status = 'PASS';
+                    extractedValue = mfg;
+                    reason = `Manufacturing / packing date declared: ${mfg}`;
 
-                // Chronological validation if expiry date is also present
-                if (exp) {
-                    const mfgParsed = parseDateToMonthYear(mfg);
-                    const expParsed = parseDateToMonthYear(exp);
-                    if (mfgParsed && expParsed) {
-                        if (mfgParsed.totalMonths >= expParsed.totalMonths) {
-                            status = 'POTENTIAL_NON_COMPLIANCE';
-                            reason = `Invalid chronological sequence: Manufacturing date (${mfg}) is equal to or later than expiry date (${exp}).`;
-                        } else {
-                            const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
-                            if (shelfLifeMonths > 60) {
-                                status = 'REVIEW';
-                                reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}). Officer review required.`;
+                    // Chronological validation if expiry date is also present
+                    if (exp) {
+                        const mfgParsed = parseDateToMonthYear(mfg);
+                        const expParsed = parseDateToMonthYear(exp);
+                        if (mfgParsed && expParsed) {
+                            if (mfgParsed.totalMonths >= expParsed.totalMonths) {
+                                status = 'POTENTIAL_NON_COMPLIANCE';
+                                reason = `Invalid chronological sequence: Manufacturing date (${mfg}) is equal to or later than expiry date (${exp}).`;
+                            } else {
+                                const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
+                                if (shelfLifeMonths > 60) {
+                                    status = 'REVIEW';
+                                    reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}). Officer review required.`;
+                                }
                             }
                         }
                     }
@@ -277,23 +297,30 @@ const evaluateRules = async (extracted) => {
             const exp = fields.dates?.expiry || fields.dates?.bestBefore;
             const mfg = fields.dates?.manufacture;
             if (exp) {
-                status = 'PASS';
-                extractedValue = exp;
-                reason = `Best before / use-by declaration detected: ${exp}`;
+                const expCheck = validateFieldFormat('dates.expiry', exp);
+                if (!expCheck.valid) {
+                    status = 'POTENTIAL_NON_COMPLIANCE';
+                    extractedValue = exp;
+                    reason = `Expiry / use-by declaration does not conform to real calendar date format: "${exp}" (${expCheck.reason}).`;
+                } else {
+                    status = 'PASS';
+                    extractedValue = exp;
+                    reason = `Best before / use-by declaration detected: ${exp}`;
 
-                // Chronological validation if mfg date is also present
-                if (mfg) {
-                    const mfgParsed = parseDateToMonthYear(mfg);
-                    const expParsed = parseDateToMonthYear(exp);
-                    if (mfgParsed && expParsed) {
-                        if (mfgParsed.totalMonths >= expParsed.totalMonths) {
-                            status = 'POTENTIAL_NON_COMPLIANCE';
-                            reason = `Invalid chronological sequence: Expiry date (${exp}) is before or equal to manufacturing date (${mfg}).`;
-                        } else {
-                            const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
-                            if (shelfLifeMonths > 60) {
-                                status = 'REVIEW';
-                                reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}).`;
+                    // Chronological validation if mfg date is also present
+                    if (mfg) {
+                        const mfgParsed = parseDateToMonthYear(mfg);
+                        const expParsed = parseDateToMonthYear(exp);
+                        if (mfgParsed && expParsed) {
+                            if (mfgParsed.totalMonths >= expParsed.totalMonths) {
+                                status = 'POTENTIAL_NON_COMPLIANCE';
+                                reason = `Invalid chronological sequence: Expiry date (${exp}) is before or equal to manufacturing date (${mfg}).`;
+                            } else {
+                                const shelfLifeMonths = expParsed.totalMonths - mfgParsed.totalMonths;
+                                if (shelfLifeMonths > 60) {
+                                    status = 'REVIEW';
+                                    reason = `Unusually long shelf life (${shelfLifeMonths} months) between mfg (${mfg}) and exp (${exp}).`;
+                                }
                             }
                         }
                     }
@@ -325,36 +352,43 @@ const evaluateRules = async (extracted) => {
             const nq = fields.netQuantity;
 
             if (usp) {
-                status = 'PASS';
-                extractedValue = usp;
-                reason = `Unit Sale Price declared: ${usp}`;
+                const uspCheck = validateFieldFormat('unitSalePrice', usp);
+                if (!uspCheck.valid) {
+                    status = 'POTENTIAL_NON_COMPLIANCE';
+                    extractedValue = usp;
+                    reason = `Unit Sale Price does not conform to valid currency/unit format: "${usp}" (${uspCheck.reason}).`;
+                } else {
+                    status = 'PASS';
+                    extractedValue = usp;
+                    reason = `Unit Sale Price declared: ${usp}`;
 
-                // Cross-field arithmetic validation against MRP ÷ Net Qty
-                if (mrp?.value && nq?.value && nq.value > 0) {
-                    const uspMatch = String(usp).match(/(?:₹|Rs\.?|INR)?\s*(\d+(?:\.\d+)?)/i);
-                    if (uspMatch) {
-                        const declaredUspVal = parseFloat(uspMatch[1]);
-                        const isPer100g = /100\s*(?:g|ml)/i.test(usp);
-                        const isPerGram = /\b(?:g|gm|gram|ml)\b/i.test(usp) && !isPer100g;
-                        const isPerKg = /\b(?:kg|kilo|liter|l)\b/i.test(usp);
+                    // Cross-field arithmetic validation against MRP ÷ Net Qty
+                    if (mrp?.value && nq?.value && nq.value > 0) {
+                        const uspMatch = String(usp).match(/(?:₹|Rs\.?|INR)?\s*(\d+(?:\.\d+)?)/i);
+                        if (uspMatch) {
+                            const declaredUspVal = parseFloat(uspMatch[1]);
+                            const isPer100g = /100\s*(?:g|ml)/i.test(usp);
+                            const isPerGram = /\b(?:g|gm|gram|ml)\b/i.test(usp) && !isPer100g;
+                            const isPerKg = /\b(?:kg|kilo|liter|l)\b/i.test(usp);
 
-                        let expectedUsp = null;
-                        if (isPer100g) {
-                            expectedUsp = (mrp.value / nq.value) * 100;
-                        } else if (isPerGram) {
-                            expectedUsp = mrp.value / nq.value;
-                        } else if (isPerKg) {
-                            const nqInKg = ['g', 'ml'].includes((nq.unit || '').toLowerCase()) ? nq.value / 1000 : nq.value;
-                            expectedUsp = mrp.value / nqInKg;
-                        }
+                            let expectedUsp = null;
+                            if (isPer100g) {
+                                expectedUsp = (mrp.value / nq.value) * 100;
+                            } else if (isPerGram) {
+                                expectedUsp = mrp.value / nq.value;
+                            } else if (isPerKg) {
+                                const nqInKg = ['g', 'ml'].includes((nq.unit || '').toLowerCase()) ? nq.value / 1000 : nq.value;
+                                expectedUsp = mrp.value / nqInKg;
+                            }
 
-                        if (expectedUsp !== null && declaredUspVal > 0) {
-                            const diffRatio = Math.abs(declaredUspVal - expectedUsp) / expectedUsp;
-                            if (diffRatio > 0.15) { // more than 15% discrepancy
-                                status = 'REVIEW';
-                                reason = `Unit Sale Price discrepancy: Declared (${usp}) differs from calculated rate (₹${expectedUsp.toFixed(2)} based on MRP ₹${mrp.value} and ${nq.value}${nq.unit}).`;
-                            } else {
-                                reason += ` (Verified: matches calculated ₹${expectedUsp.toFixed(2)} within tolerance)`;
+                            if (expectedUsp !== null && declaredUspVal > 0) {
+                                const diffRatio = Math.abs(declaredUspVal - expectedUsp) / expectedUsp;
+                                if (diffRatio > 0.15) { // more than 15% discrepancy
+                                    status = 'REVIEW';
+                                    reason = `Unit Sale Price discrepancy: Declared (${usp}) differs from calculated rate (₹${expectedUsp.toFixed(2)} based on MRP ₹${mrp.value} and ${nq.value}${nq.unit}).`;
+                                } else {
+                                    reason += ` (Verified: matches calculated ₹${expectedUsp.toFixed(2)} within tolerance)`;
+                                }
                             }
                         }
                     }
@@ -386,27 +420,34 @@ const evaluateRules = async (extracted) => {
 
         // ---------------------------------------------------------
         // C. Uncertainty & Provenance Propagation from Declarations
+        // Applied uniformly to all LM-xx rules (Master Prompt Section 5).
         // ---------------------------------------------------------
         const RULE_DECLARATION_MAP = {
-            'LM-01': ['manufacturer', 'packer', 'importer'],
+            'LM-01': ['manufacturer', 'packer', 'importer', 'marketer'],
             'LM-02': ['countryOfOrigin'],
-            'LM-03': ['genericCommodityName', 'productName'],
+            'LM-03': ['genericCommodityName', 'productName', 'brandName'],
             'LM-04': ['netQuantity'],
             'LM-05': ['mrp'],
-            'LM-06': ['manufactureDate'],
-            'LM-07': ['expiryDate'],
+            'LM-06': ['manufacturingDate', 'manufactureDate'],
+            'LM-07': ['expiryDate', 'bestBefore'],
             'LM-08': ['consumerCare'],
             'LM-09': ['unitSalePrice'],
             'LM-10': ['batchNumber']
         };
 
+        let systemNote = null;
         const declKeys = RULE_DECLARATION_MAP[code] || [];
         const declObj = declKeys.map(k => declarations[k]).find(Boolean);
-        if (declObj && status === 'PASS') {
-            if (declObj.status === 'unverified' || declObj.needsReview === true || (typeof declObj.confidence === 'number' && declObj.confidence < 0.65)) {
-                status = 'REVIEW';
+        if (declObj) {
+            const isLowConfidence = typeof declObj.confidence === 'number' && declObj.confidence < 0.85;
+            const isUncertain = declObj.status === 'unverified' || declObj.needsReview === true || declObj.aiAssisted === true || isLowConfidence;
+            
+            if (isUncertain) {
                 const confDisplay = typeof declObj.confidence === 'number' ? `${Math.round(declObj.confidence * 100)}%` : 'unverified';
-                reason += ` [Officer Review Required: Field declaration carries uncertainty (${confDisplay} confidence).]`;
+                systemNote = `Declaration flagged for officer review: ${declObj.source || 'AI-assisted/low confidence'} (${confDisplay}).`;
+                if (status === 'PASS') {
+                    status = 'REVIEW';
+                }
             }
         }
 
@@ -417,6 +458,7 @@ const evaluateRules = async (extracted) => {
             confidence: confidence,
             extractedValue: extractedValue,
             reason: reason,
+            systemNote: systemNote,
             sourceReference: rule.sourceReference || 'Legal Metrology (Packaged Commodities) Rules, 2011',
             severity: rule.severity || 'medium'
         });

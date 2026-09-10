@@ -26,6 +26,56 @@ const GEMINI_FALLBACK_CONFIDENCE_THRESHOLD = parseFloat(
  * Rejects any Gemini response that doesn't match the expected shape, preventing
  * misplaced values (e.g., quantity appearing under productName).
  */
+/**
+ * Helper: Detect if a string is shaped like a calendar date.
+ * Matches standard date formats (DD/MM/YYYY, MM/YYYY, Month YYYY, etc.).
+ * Identity fields (productName, brandName, genericCommodityName) must NEVER match this.
+ */
+const isDateShaped = (text) => {
+    if (!text || typeof text !== 'string') return false;
+    const s = text.trim();
+    if (s.length < 4) return false;
+    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(s)) return true;
+    if (/\b\d{1,2}[/]\d{2,4}\b/.test(s)) return true;
+    if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
+    if (/\b\d{1,2}[\s./-]+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
+    if (/\b(?:BEST\s*BEFORE|EXP|EXPIRY|USE\s*BY|MFG|MFD|PKD|PACKED)\b/i.test(s) && /\d/.test(s)) return true;
+    return false;
+};
+
+/**
+ * Valid standard metric mass/volume units and packaging count units.
+ * Non-units such as "n", "u", "ch", or arbitrary noise tokens must be rejected.
+ */
+const VALID_MASS_VOLUME_UNITS = new Set([
+    'g', 'gm', 'gms', 'gram', 'grams',
+    'kg', 'kgs', 'kilogram', 'kilograms',
+    'mg', 'milligram', 'milligrams',
+    'ml', 'mls', 'millilitre', 'millilitres', 'milliliter', 'milliliters',
+    'l', 'lt', 'ltr', 'litre', 'litres', 'liter', 'liters',
+    'cl'
+]);
+
+const VALID_COUNT_UNITS = new Set([
+    'capsules', 'capsule', 'tablets', 'tablet',
+    'softgels', 'softgel', 'pieces', 'piece',
+    'sachets', 'sachet', 'units', 'unit',
+    'packs', 'pack', 'candies', 'gummies',
+    'bars', 'pouches', 'vials', 'ampoules',
+    'rolls', 'sheets', 'wipes'
+]);
+
+const isValidQuantityUnit = (unit) => {
+    if (!unit || typeof unit !== 'string') return false;
+    const u = unit.trim().toLowerCase();
+    return VALID_MASS_VOLUME_UNITS.has(u) || VALID_COUNT_UNITS.has(u);
+};
+
+/**
+ * Phase 6 (Audit Fix): Strict schema validation for Gemini structuring output.
+ * Rejects any Gemini response that doesn't match the expected shape, preventing
+ * misplaced values (e.g., quantity appearing under productName).
+ */
 const validateGeminiFieldResult = (field, data) => {
     if (!data || typeof data !== 'object') return null;
     if (data.value === null || data.value === undefined) return null;
@@ -33,12 +83,30 @@ const validateGeminiFieldResult = (field, data) => {
     if (typeof data.value !== 'string' && typeof data.value !== 'number') return null;
     // Reject suspiciously short values (likely noise)
     if (typeof data.value === 'string' && data.value.trim().length === 0) return null;
-    // Field-specific validation: prices should not appear in name fields
-    if (field === 'productName' || field === 'manufacturer.name' || field === 'marketer.name') {
+    
+    // Field-specific validation: identity fields
+    if (field === 'productName' || field === 'brandName' || field === 'genericCommodityName' ||
+        field === 'manufacturer.name' || field === 'marketer.name') {
         const val = String(data.value).trim();
+        // Reject if value is date-shaped
+        if (isDateShaped(val)) return null;
+        // Reject if marketing badge
+        if (isMarketingBadge(val)) return null;
         // Reject if value looks like a quantity ("500 ml", "1 kg") or price ("₹120")
         if (/^\d+(\.\d+)?\s*(ml|g|kg|l|mg|mcg|oz|lb)$/i.test(val)) return null;
         if (/^[₹$€£]?\s*\d+(\.\d+)?$/.test(val)) return null;
+    }
+    // Net quantity validation: must have valid metric or count unit
+    if (field === 'netQuantity') {
+        const nqm = String(data.value).match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
+        if (nqm) {
+            if (!isValidQuantityUnit(nqm[2])) return null;
+        }
+    }
+    // Date validation
+    if (field === 'dates.manufacture' || field === 'dates.expiry') {
+        const fmt = validateFieldFormat(field, data.value);
+        if (!fmt.valid) return null;
     }
     // For price fields, value should be numeric or a price string
     if (field === 'mrp' || field === 'unitSalePrice') {
@@ -55,7 +123,6 @@ const validateGeminiFieldResult = (field, data) => {
  */
 const MARKETING_BADGE_PATTERNS = [
     /100\s*%\s*(?:authentic|pure|natural|organic|vegetarian|veg|genuine)/i,
-    /\b(?:NUTHENTIC|AUTHENTIC)\b/i,
     /\b(?:certified|premium|quality|original|guaranteed|approved|tested|verified)\b/i,
     /\b(?:ISO|GMP|HACCP|WHO|GLP)\s*(?:certified|approved)?\b/i,
     /\b(?:Halal|Kosher|Vegan|Gluten\s*Free)\s*(?:Certified)?\b/i,
@@ -85,9 +152,32 @@ const validateFieldFormat = (fieldName, value) => {
     if (value === null || value === undefined) return { valid: true, value: null };
 
     switch (fieldName) {
+        case 'productName':
+        case 'brandName':
+        case 'genericCommodityName': {
+            const str = String(value).trim();
+            if (isDateShaped(str)) {
+                return { valid: false, reason: `Field value "${str}" is date-shaped — rejected` };
+            }
+            if (isMarketingBadge(str)) {
+                return { valid: false, reason: `Field value "${str}" is a promotional/marketing badge — rejected` };
+            }
+            if (str.length < 2) {
+                return { valid: false, reason: 'Too short to be a valid identity declaration' };
+            }
+            return { valid: true, value: str };
+        }
         case 'netQuantity': {
-            // Net quantity must be a number + unit. If the raw text element
-            // contains 5+ words or obvious ingredient/nutrition content, reject.
+            if (value && typeof value === 'object') {
+                const { value: val, unit } = value;
+                if (val === null || val === undefined || isNaN(parseFloat(val)) || parseFloat(val) <= 0) {
+                    return { valid: false, reason: 'Net quantity has non-numeric or non-positive value' };
+                }
+                if (!isValidQuantityUnit(unit)) {
+                    return { valid: false, reason: `Unit "${unit}" is not a recognized standard metric or count unit` };
+                }
+                return { valid: true, value };
+            }
             const rawStr = String(value);
             if (/(?:protein|carbohydrate|fat|sugar|sodium|fiber|energy|kcal|ingredient|preservative|humectant|acid|how\s*to|direction|storage)/i.test(rawStr)) {
                 return { valid: false, reason: 'Contains ingredient/nutrition text — not a valid net quantity' };
@@ -95,6 +185,10 @@ const validateFieldFormat = (fieldName, value) => {
             const wordCount = rawStr.trim().split(/\s+/).length;
             if (wordCount > 5) {
                 return { valid: false, reason: `Net quantity has ${wordCount} words — likely contaminated with adjacent text` };
+            }
+            const nqm = rawStr.match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
+            if (nqm && !isValidQuantityUnit(nqm[2])) {
+                return { valid: false, reason: `Unit "${nqm[2]}" is not a recognized standard metric or count unit` };
             }
             return { valid: true, value };
         }
@@ -117,6 +211,15 @@ const validateFieldFormat = (fieldName, value) => {
             // Must contain at least a month or number pattern
             if (!/(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|\d{1,2}[/-]\d{2,4})/i.test(dateStr)) {
                 return { valid: false, reason: 'Does not match any recognized date format' };
+            }
+            // Disallow obvious non-date artifacts like "DECD 50"
+            const monthWordMatch = dateStr.match(/^([A-Za-z]+)\s*(\d+)$/);
+            if (monthWordMatch) {
+                const VALID_MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+                                      'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
+                if (!VALID_MONTHS.includes(monthWordMatch[1].toUpperCase())) {
+                    return { valid: false, reason: `"${monthWordMatch[1]}" is not a recognized calendar month` };
+                }
             }
             return { valid: true, value };
         }
@@ -474,7 +577,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // -------------------------------------------------------------
     // 4. Dates: Manufacture, Expiry & Best Before
     // -------------------------------------------------------------
-    const MONTH_PATTERN = '(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*';
+    const MONTH_PATTERN = '(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)';
     const textDateRegex = new RegExp(`(${MONTH_PATTERN})[\\s./-]*(\\d{4}|\\d{2})`, 'i');
     const fullDateRegex = /\b(0?[1-9]|[12]\d|3[01])[-/](0?[1-9]|1[012])[-/](20\d\d)\b/;
     const monthYearSlashRegex = /\b(0?[1-9]|1[012])[/](20\d\d)\b/;
@@ -495,7 +598,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     // Phase 5: Pair isolated month tokens (e.g. "NOV") with nearby isolated year tokens (e.g. "2027")
     const isolatedMonthRegex = new RegExp(`^(?:(?:EXP|EXPIRY|USE\\s*BY|MFG|PKD|PACKED)[.:\\s]*)?(${MONTH_PATTERN})[\\s./-]*$`, 'i');
-    const isolatedYearRegex = /^(?:20\d{2}|\d{2})$/;
+    const isolatedYearRegex = /^(?:20\d{2}|2[0-9]|3[0-5])$/;
 
     rawElements.forEach((el, idx) => {
         if (/[+]|kcal|usp|per|mrp|ins\s*\d|servings/i.test(el.text)) return;
@@ -775,7 +878,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     if (sizeMatch) {
         let rawSize = sizeMatch[1].trim();
         // Bug 3 fix: Truncate at field boundaries — stop before nutrition table, how-to-use, storage, etc.
-        const truncateAt = rawSize.search(/\b(?:Energy|Protein|Fat|Carbohydrate|Sugar|Sodium|Fiber|Calories|kcal|How\s*to|Directions|Storage|Store|Keep\s*in|Nutrition|Amount\s*Per|Daily\s*Value|Creatine\s*Monohydrate|\d+(?:\.\d+)?\s*(?:kcal|mg|mcg))\b/i);
+        const truncateAt = rawSize.search(/\b(?:Energy|Protein|Fat|Carbohydrate|Sugar|Sodium|Fiber|Calories|kcal|How\s*to|Directions|Storage|Store|Keep\s*in|Nutrition|Amount\s*Per|Daily\s*Value|\d+(?:\.\d+)?\s*(?:kcal|mg|mcg))\b/i);
         if (truncateAt > 0) {
             rawSize = rawSize.substring(0, truncateAt).trim();
         }
@@ -822,9 +925,9 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    // Pattern B: Count of commodity (e.g. "60 Capsules", "60 Tablets", "60 N")
+    // Pattern B: Count of commodity (e.g. "60 Capsules", "60 Tablets", "60 Softgels")
     if (!netQtyVal) {
-        const commodityCountRegex = /\b(\d+)\s*(Capsules|Tablets|Softgels|Cap|Pcs|Units|N)\b/i;
+        const commodityCountRegex = /\b(\d+)\s*(Capsules|Tablets|Softgels|Cap|Pcs|Units)\b/i;
         for (const el of rawElements) {
             // Must not be in nutrition panel or ingredients list
             if (/per serving|daily|value|protein|carbohydrate|fat|ins\s*\d/i.test(el.text)) continue;
@@ -867,19 +970,23 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
+    const isUnitValid = netQtyVal !== null && isValidQuantityUnit(netQtyUnit);
     declarations.netQuantity = {
         value: netQtyVal,
         unit: netQtyUnit,
         rawText: netQtyElem ? netQtyElem.text : null,
-        confidence: netQtyElem ? netQtyElem.confidence : 0,
+        confidence: isUnitValid ? (netQtyElem ? netQtyElem.confidence : 0) : 0.3,
         sourceImageId,
         sourceRegion: { bbox: netQtyElem ? netQtyElem.bbox : [] },
-        status: netQtyVal ? 'verified' : 'not_detected',
+        status: isUnitValid ? 'verified' : (netQtyVal ? 'unverified' : 'not_detected'),
+        needsReview: !isUnitValid && netQtyVal !== null,
         evidence: netQtyElem ? [netQtyElem.text] : []
     };
     validation.netQuantity = {
-        status: netQtyVal ? 'verified' : 'not_detected',
-        reason: netQtyVal ? `Declared Net Quantity: ${netQtyVal} ${netQtyUnit}` : 'Net quantity declaration not detected'
+        status: isUnitValid ? 'verified' : (netQtyVal ? 'unverified' : 'not_detected'),
+        reason: isUnitValid 
+            ? `Declared Net Quantity: ${netQtyVal} ${netQtyUnit}` 
+            : (netQtyVal ? `Net quantity unit "${netQtyUnit}" is not a recognized metric or count unit` : 'Net quantity declaration not detected')
     };
 
     // -------------------------------------------------------------
@@ -1123,49 +1230,44 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     let prodName = null;
     let prodNameElem = null;
 
-    // Must NEVER match ingredients, dates, lot numbers, prices, or header boilerplate
-    const titleMatch = rawElements.find(el => {
-        const t = el.text;
-        return (/Fish\s*O[il]{2}/i.test(t) || /Optimum\s*Nutrition/i.test(t) || /Coca-?Cola/i.test(t) || /Bhujia\s*Sev/i.test(t)) &&
-               !/^(?:ingredients|ngedients|nutrition|per serving|energy)/i.test(t);
+    // Evaluate candidate lines only if they represent affirmative product titles
+    const candidateTitleLines = rawElements.filter(el => {
+        const tr = el.text.trim();
+        if (isDateShaped(tr) || isMarketingBadge(tr)) return false;
+
+        // Ban non-title content (nutrition, ingredients, dates, prices, addresses, etc.)
+        const isDisallowed = /^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommended|for feedback|customer|bath|lot|date|values|rda|sugar|sodium|mg|kcal|tablets|capsules|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|website)/i.test(tr) ||
+            /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|online)\b/i.test(tr) ||
+            /^[a-z]{1,8}$/.test(tr) || // Reject single short all-lowercase fragment
+            /^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(tr) ||
+            textDateRegex.test(tr) ||
+            /^[A-Z]{2,6}\d{4,10}$/i.test(tr) ||
+            /^\d+(?:\.\d+)?$/.test(tr) ||
+            /^\d+\.\d{2}$/.test(tr) ||
+            /\d{2}:\d{2}/.test(tr) ||
+            tr === batchVal ||
+            (mrpVal && (tr === mrpVal.toString() || tr === mrpVal.toFixed(2))) ||
+            /^\d{2,5}\.\d{2}$/.test(tr);
+        return !isDisallowed && tr.length >= 4 && tr.length <= 50;
     });
 
-    if (titleMatch) {
-        prodName = titleMatch.text.replace(/[\^~_]/g, '').trim();
-        prodNameElem = titleMatch;
-    } else {
-        // Evaluate candidate lines only if they represent affirmative product titles
-        const candidateLines = rawElements.filter(el => {
-            const tr = el.text.trim();
-            // Ban everything non-title
-            const isDisallowed = /^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommended|for feedback|customer|bath|lot|date|values|rda|sugar|sodium|mg|kcal|tablets|capsules|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|website)/i.test(tr) ||
-                /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|online)\b/i.test(tr) ||
-                /^[a-z]{1,8}$/.test(tr) || // Reject single short all-lowercase fragment
-                /^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(tr) ||
-                textDateRegex.test(tr) ||
-                /^[A-Z]{2,6}\d{4,10}$/i.test(tr) ||
-                /^\d+(?:\.\d+)?$/.test(tr) ||
-                /^\d+\.\d{2}$/.test(tr) ||
-                /\d{2}:\d{2}/.test(tr) ||
-                tr === batchVal ||
-                (mrpVal && (tr === mrpVal.toString() || tr === mrpVal.toFixed(2))) ||
-                /^\d{2,5}\.\d{2}$/.test(tr);
-            return !isDisallowed && tr.length >= 4 && tr.length <= 50;
+    // Only accept if line is not an ingredient snippet and is a plausible title
+    if (candidateTitleLines.length > 0) {
+        const topCandidate = candidateTitleLines.find(c => {
+            const tr = c.text.trim();
+            if (/gelling agent|edible oil|preservatives|contain|storage|keep in|manufactured/i.test(tr)) return false;
+            if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured)$/i.test(tr)) return false;
+            return tr.split(/\s+/).length >= 2 || tr.length >= 6;
         });
-
-        // Only accept if line is not an ingredient snippet and is a plausible title
-        if (candidateLines.length > 0) {
-            const topCandidate = candidateLines.find(c => {
-                const tr = c.text.trim();
-                if (/gelling agent|edible oil|preservatives|contain|storage|keep in|manufactured/i.test(tr)) return false;
-                if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured)$/i.test(tr)) return false;
-                return tr.split(/\s+/).length >= 2 || tr.length >= 6;
-            });
-            if (topCandidate) {
-                prodName = topCandidate.text.trim();
-                prodNameElem = topCandidate;
-            }
+        if (topCandidate) {
+            prodName = topCandidate.text.trim();
+            prodNameElem = topCandidate;
         }
+    }
+
+    if (prodName && (isDateShaped(prodName) || isMarketingBadge(prodName))) {
+        prodName = null;
+        prodNameElem = null;
     }
 
     declarations.productName = createEvidenceRecord(prodName, prodNameElem, prodName ? 'verified' : 'not_detected');
@@ -1176,7 +1278,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     // -------------------------------------------------------------
     // 13. Brand Name Extraction (SEPARATE FROM PRODUCT NAME)
-    // The brand/trade name of the company (e.g. NUTRABOX, Optimum Nutrition).
+    // The brand/trade name of the company.
     // NOT the product/variant name, NOT the generic commodity name.
     // Marketing/quality badges (100% Authentic, Certified, etc.) are excluded.
     // -------------------------------------------------------------
@@ -1184,18 +1286,15 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     let brandNameElem = null;
 
     // Strategy A: Extract brand from manufacturer/marketer name if available
-    // (The brand often matches the company trading name)
     const possibleBrandFromParty = mfrName || mktName;
 
     // Strategy B: Find prominent uppercase text that looks like a brand
-    // Brands are typically short (1-4 words), uppercase or title-case, and appear
-    // prominently on the front of packaging.
     const brandCandidates = rawElements.filter(el => {
         const tr = el.text.trim();
         // Must be 2-40 chars, not a known non-brand pattern
         if (tr.length < 2 || tr.length > 40) return false;
-        // Must not be a marketing badge
-        if (isMarketingBadge(tr)) return false;
+        // Must not be a marketing badge or date-shaped
+        if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
         // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
         if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|sugar|sodium|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution)/i.test(tr)) return false;
         // Must not be a date, number-only, or batch code
@@ -1221,9 +1320,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
             brandNameElem = matchingCandidate;
         }
     }
-    // Fallback: use the first prominent uppercase candidate
+    // Fallback: use the most prominent candidate by bbox area
     if (!brandNameVal && brandCandidates.length > 0) {
-        // Pick the one with the largest bounding box area (most prominent on pack)
         let bestArea = 0;
         for (const c of brandCandidates) {
             if (c.bbox && c.bbox.length >= 4) {
@@ -1237,11 +1335,15 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
                 }
             }
         }
-        // If no bbox data, take the first candidate
         if (!brandNameVal) {
             brandNameVal = brandCandidates[0].text.trim();
             brandNameElem = brandCandidates[0];
         }
+    }
+
+    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal))) {
+        brandNameVal = null;
+        brandNameElem = null;
     }
 
     declarations.brandName = createEvidenceRecord(brandNameVal, brandNameElem, brandNameVal ? 'verified' : 'not_detected');
@@ -1251,14 +1353,13 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     };
 
     // Disambiguation: If brand matches what was picked as productName,
-    // re-assign productName to the next best candidate (the brand IS the company,
-    // productName should be the specific product/variant).
+    // re-assign productName to the next best candidate
     if (brandNameVal && prodName && brandNameVal.toLowerCase().trim() === prodName.toLowerCase().trim()) {
         const nextProductCandidate = rawElements.find(el => {
             const tr = el.text.trim();
             if (tr.length < 4 || tr.length > 60) return false;
             if (tr.toLowerCase() === brandNameVal.toLowerCase()) return false;
-            if (isMarketingBadge(tr)) return false;
+            if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
             if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|usp|rs\.?|price|manufactured|marketed|packed|imported|country)/i.test(tr)) return false;
             if (/^[\d.]+$/.test(tr)) return false;
             if (tr.split(/\s+/).length >= 2 || tr.length >= 6) return true;
@@ -1278,8 +1379,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     // -------------------------------------------------------------
     // 14. Generic Commodity Name Extraction (Legal Metrology requirement)
-    // The common/generic name of the commodity (e.g. "Creatine Monohydrate",
-    // "Multivitamin Tablets", "Tomato Ketchup"). Required by Legal Metrology
+    // The common/generic name of the commodity as required by Legal Metrology
     // rules as a separate declaration from the marketing/brand name.
     // -------------------------------------------------------------
     let genericCommodityNameVal = null;
@@ -1293,51 +1393,16 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
             const candidate = gnm[1].trim();
             // Stop at field boundaries
             const truncated = candidate.replace(/\b(?:Manufactured|Marketed|Packed|Imported|FSSAI|Net|MRP|Batch|Exp|Best|Country)\b.*/i, '').trim();
-            if (truncated.length > 2 && !isMarketingBadge(truncated)) {
+            if (truncated.length > 2 && !isMarketingBadge(truncated) && !isDateShaped(truncated)) {
                 genericCommodityNameVal = truncated;
                 genericCommodityNameElem = el;
+                break;
             }
         }
     }
 
-    // Strategy B: Look for common food/supplement type descriptors near the product name
-    if (!genericCommodityNameVal) {
-        const commodityPatterns = [
-            /\b((?:Micronized\s+)?Creatine\s+Monohydrate)\b/i,
-            /\b(Whey\s+Protein(?:\s+(?:Isolate|Concentrate|Blend))?)\b/i,
-            /\b(Multivitamin\s+(?:Tablets?|Capsules?|Softgels?))\b/i,
-            /\b(Fish\s+Oil\s*(?:Capsules?|Softgels?)?)\b/i,
-            /\b((?:Mixed\s+)?(?:Fruit|Mango|Orange|Apple)\s+(?:Juice|Drink|Beverage))\b/i,
-            /\b(Tomato\s+(?:Ketchup|Sauce))\b/i,
-            /\b((?:Refined\s+)?(?:Sunflower|Soybean|Mustard|Olive|Coconut|Groundnut)\s+Oil)\b/i,
-            /\b((?:Basmati\s+)?Rice)\b/i,
-            /\b((?:Wheat|Maida|Atta)\s*(?:Flour)?)\b/i,
-            /\b(Instant\s+(?:Noodles|Oats|Coffee))\b/i,
-            /\b((?:Milk\s+)?Chocolate(?:\s+(?:Bar|Candy))?)\b/i,
-            /\b(Biscuits?|Cookies?|Wafers?)\b/i,
-            /\b((?:Carbonated|Aerated)\s+(?:Drink|Beverage|Water))\b/i,
-            /\b(Mineral\s+Water|Packaged\s+Drinking\s+Water)\b/i,
-            /\b(Tea(?:\s+(?:Bags?|Leaves?|Powder))?)\b/i,
-            /\b((?:Roasted|Salted|Mixed)\s+(?:Peanuts|Cashews|Almonds|Nuts))\b/i,
-            /\b(Bhujia(?:\s+Sev)?)\b/i,
-            /\b((?:Dietary|Nutritional|Food)\s+Supplement)\b/i,
-            /\b(Energy\s+(?:Drink|Bar))\b/i,
-            /\b(Protein\s+(?:Powder|Bar|Shake))\b/i,
-        ];
-        for (const el of rawElements) {
-            // Skip nutrition/ingredient panels
-            if (/per serving|daily value|amount per|nutrition facts/i.test(el.text)) continue;
-            for (const pat of commodityPatterns) {
-                const cm = el.text.match(pat);
-                if (cm && cm[1].trim().length > 2 && !isMarketingBadge(cm[1])) {
-                    genericCommodityNameVal = cm[1].trim();
-                    genericCommodityNameElem = el;
-                    break;
-                }
-            }
-            if (genericCommodityNameVal) break;
-        }
-    }
+    // Strategy B: If no explicit label is printed on the package, leave as null for the first pass.
+    // The mandatory Gemini verification pass will classify/verify genericCommodityName using visual reasoning.
 
     declarations.genericCommodityName = createEvidenceRecord(
         genericCommodityNameVal, genericCommodityNameElem,
@@ -1466,21 +1531,6 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
         return extractFields([]);
     }
 
-    if (extractedList.length === 1) {
-        const single = extractedList[0];
-        return {
-            ...single,
-            _singleExtractions: extractedList,
-            conflicts: [],
-            reconciliation: {
-                fields: {},
-                conflicts: [],
-                geminiUsed: false
-            },
-            photoCount: 1
-        };
-    }
-
     const merged = {
         productName: null,
         brandName: null,
@@ -1542,7 +1592,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
 
     /**
      * Basic normalization: removes whitespace, punctuation, converts to lowercase.
-     * Used for Phase 1 (free) comparison before Gemini.
+     * Used for Phase 1 comparison before Gemini.
      */
     const normalize = (s) => {
         if (typeof s !== 'string') return String(s || '').toLowerCase().trim();
@@ -1553,7 +1603,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
      * Check if two values are "close enough" without needing Gemini:
      * - Case-insensitive match
      * - One is a substring of the other  
-     * - >80% word overlap (e.g., "Optimum Nutrition" vs "OPTIMUM")
+     * - >80% word overlap
      */
     const isBasicallyEqual = (a, b) => {
         const na = normalize(a);
@@ -1570,7 +1620,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
         return overlapRatio >= 0.8;
     };
 
-    // Fields that still have conflicts after basic normalization (need Gemini)
+    // Fields that need Gemini semantic reconciliation
     const fieldsNeedingGemini = {};
 
     /**
@@ -1597,7 +1647,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
         if (observations.length === 0) {
             fieldStatus = 'not_detected';
         } else if (observations.length === 1) {
-            fieldStatus = 'single_verified_observation';
+            fieldStatus = 'single_observation';
             resolvedValue = observations[0].value;
             setter(merged, resolvedValue);
         } else {
@@ -1614,13 +1664,12 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                 resolvedValue = uniqueVals[0].value;
                 setter(merged, resolvedValue);
             } else {
-                // Phase 5 Fix 1: Try basic normalization first
+                // Try basic normalization first
                 const allBasicallyEqual = uniqueVals.every((u, i) => 
                     i === 0 || isBasicallyEqual(String(u.value), String(uniqueVals[0].value))
                 );
 
                 if (allBasicallyEqual) {
-                    // Resolved by basic normalization — pick the longest/most complete value
                     fieldStatus = 'reconciled_basic';
                     const best = uniqueVals.reduce((a, b) => 
                         String(a.value).length >= String(b.value).length ? a : b
@@ -1629,7 +1678,6 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                     setter(merged, resolvedValue);
                     console.log(`[Reconciliation] ${fieldName}: basic normalization resolved — "${resolvedValue}"`);
                 } else {
-                    // Still conflicting — collect for Gemini (Phase 2)
                     fieldStatus = 'pending_gemini';
                     resolvedValue = observations[0].value;
                     setter(merged, resolvedValue);
@@ -1745,35 +1793,27 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     });
 
     // =========================================================================
-    // Phase 5 Fix 1 — Phase 2: Gemini Semantic Reconciliation
-    // Only called for fields that couldn't be resolved by basic normalization
+    // Phase 5 Fix 1 — Phase 2: Mandatory Gemini Verification for Identity Fields
+    // (Master Prompt Section 1: productName, brandName, and genericCommodityName
+    // must pass through Gemini verification on EVERY scan, single or multi-photo).
     // =========================================================================
-    // Phase 5 Accuracy Overhaul: High-stakes fields always eligible for verification (Finding 2)
     const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
     highStakesVerificationFields.forEach(f => {
         if (!fieldsNeedingGemini[f]) {
-            const decl = merged.declarations?.[f];
-            const isUnverified = !decl || decl.status !== 'verified' || !decl.value;
-            // Also verify if brand matches marketer or product name matches brand
-            const isSuspicious = f === 'brandName' && merged.marketer?.name && merged.brandName &&
-                merged.brandName.toLowerCase().includes(merged.marketer.name.toLowerCase());
-            if (isUnverified || isSuspicious) {
-                const obs = extractedList.map((e, idx) => {
-                    const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
-                    return val ? { value: String(val), photoId: `Photo #${idx + 1}`, rawText: String(val) } : null;
-                }).filter(Boolean);
-                if (obs.length > 0) {
-                    fieldsNeedingGemini[f] = obs;
-                }
-            }
+            const obs = extractedList.map((e, idx) => {
+                const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
+                return val ? { value: String(val), photoId: `Photo #${idx + 1}`, rawText: String(val) } : null;
+            }).filter(Boolean);
+            fieldsNeedingGemini[f] = obs.length > 0 ? obs : [{ value: '', photoId: 'Photo #1', rawText: '' }];
         }
     });
 
     if (Object.keys(fieldsNeedingGemini).length > 0 && geminiService.isAvailable()) {
-        console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) need Gemini reconciliation:`, Object.keys(fieldsNeedingGemini));
+        console.log(`[Reconciliation] Running Gemini verification on ${Object.keys(fieldsNeedingGemini).length} field(s):`, Object.keys(fieldsNeedingGemini));
         
         try {
-            const geminiResult = await geminiService.reconcileFields(fieldsNeedingGemini);
+            const allOcrTexts = (merged.rawOcrText || []).map(r => r.text || '').filter(Boolean);
+            const geminiResult = await geminiService.reconcileFields(fieldsNeedingGemini, allOcrTexts);
             merged.reconciliation.geminiUsed = true;
             
             if (!geminiResult.skipped && geminiResult.reconciledFields) {
@@ -1789,7 +1829,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         
                         const conflictRecord = {
                             field: fieldName,
-                            detectedValues: fieldsNeedingGemini[fieldName].map(c => ({
+                            detectedValues: (fieldsNeedingGemini[fieldName] || []).map(c => ({
                                 photo: c.photoId,
                                 value: c.value
                             })),
@@ -1798,8 +1838,14 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         };
                         merged.conflicts.push(conflictRecord);
                         merged.reconciliation.conflicts.push(conflictRecord);
-                    } else {
-                        // Gemini resolved the conflict — these are the same entity
+                    } else if (result.value) {
+                        // Enforce format validation before accepting reconciled value
+                        const formatVal = validateFieldFormat(fieldName, result.value);
+                        if (!formatVal.valid) {
+                            console.warn(`[Reconciliation] Rejected invalid format for reconciled field "${fieldName}": "${result.value}" (${formatVal.reason})`);
+                            continue;
+                        }
+
                         if (reconField) {
                             reconField.status = 'reconciled_gemini';
                             reconField.resolvedValue = result.value;
@@ -1838,62 +1884,102 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                 }
             }
 
-            // Finding 1: Apply brand classification with confidence-based overwrite policy
+            // Section 1 & 3: Apply brand classification with confidence-based overwrite policy
             if (geminiResult.brandClassification) {
                 const bc = geminiResult.brandClassification;
                 
                 const canOverwriteIdentity = (fieldKey, currentVal) => {
                     if (!currentVal) return true;
+                    if (isDateShaped(currentVal)) return true;
                     const decl = merged.declarations?.[fieldKey];
                     if (!decl || decl.status !== 'verified') return true;
-                    if (decl.confidence && decl.confidence < 0.85) return true;
+                    if (decl.confidence !== undefined && decl.confidence < 0.85) return true;
                     if (merged.conflicts?.some(c => c.field === fieldKey)) return true;
                     // If brandName matches marketer name or is an obvious badge, allow overwrite
                     if (fieldKey === 'brandName' && merged.marketer?.name &&
                         String(currentVal).toLowerCase().includes(String(merged.marketer.name).toLowerCase())) {
                         return true;
                     }
+                    // For heuristic extractions from first pass, allow Gemini classification to refine
+                    if (decl.source !== 'gemini_reconciliation') return true;
                     return false;
                 };
 
                 if (bc.brand && canOverwriteIdentity('brandName', merged.brandName)) {
-                    console.log(`[Reconciliation] Overwriting brandName: "${merged.brandName}" -> "${bc.brand}" via Gemini classification`);
-                    merged.brandName = bc.brand;
-                    if (!merged.declarations.brandName) merged.declarations.brandName = { value: null };
-                    merged.declarations.brandName.value = bc.brand;
-                    merged.declarations.brandName.source = 'gemini_reconciliation';
-                    merged.declarations.brandName.aiAssisted = true;
-                    merged.declarations.brandName.status = 'ai_assisted';
+                    const validation = validateFieldFormat('brandName', bc.brand);
+                    if (validation.valid) {
+                        console.log(`[Reconciliation] Verified/overwriting brandName: "${merged.brandName}" -> "${bc.brand}" via Gemini classification`);
+                        merged.brandName = bc.brand;
+                        if (!merged.declarations.brandName) merged.declarations.brandName = { value: null };
+                        merged.declarations.brandName.value = bc.brand;
+                        merged.declarations.brandName.source = 'gemini_reconciliation';
+                        merged.declarations.brandName.aiAssisted = true;
+                        merged.declarations.brandName.status = 'ai_assisted';
+                    } else {
+                        console.warn(`[Reconciliation] Format check rejected Gemini brandName: "${bc.brand}" (${validation.reason})`);
+                    }
                 }
 
                 if (bc.productName && canOverwriteIdentity('productName', merged.productName)) {
-                    console.log(`[Reconciliation] Overwriting productName: "${merged.productName}" -> "${bc.productName}" via Gemini classification`);
-                    merged.productName = bc.productName;
-                    if (!merged.declarations.productName) merged.declarations.productName = { value: null };
-                    merged.declarations.productName.value = bc.productName;
-                    merged.declarations.productName.source = 'gemini_reconciliation';
-                    merged.declarations.productName.aiAssisted = true;
-                    merged.declarations.productName.status = 'ai_assisted';
+                    const validation = validateFieldFormat('productName', bc.productName);
+                    if (validation.valid) {
+                        console.log(`[Reconciliation] Verified/overwriting productName: "${merged.productName}" -> "${bc.productName}" via Gemini classification`);
+                        merged.productName = bc.productName;
+                        if (!merged.declarations.productName) merged.declarations.productName = { value: null };
+                        merged.declarations.productName.value = bc.productName;
+                        merged.declarations.productName.source = 'gemini_reconciliation';
+                        merged.declarations.productName.aiAssisted = true;
+                        merged.declarations.productName.status = 'ai_assisted';
+                    } else {
+                        console.warn(`[Reconciliation] Format check rejected Gemini productName: "${bc.productName}" (${validation.reason})`);
+                    }
                 }
 
                 if (bc.genericName && canOverwriteIdentity('genericCommodityName', merged.genericCommodityName)) {
-                    console.log(`[Reconciliation] Overwriting genericCommodityName: "${merged.genericCommodityName}" -> "${bc.genericName}" via Gemini classification`);
-                    merged.genericCommodityName = bc.genericName;
-                    if (!merged.declarations.genericCommodityName) merged.declarations.genericCommodityName = { value: null };
-                    merged.declarations.genericCommodityName.value = bc.genericName;
-                    merged.declarations.genericCommodityName.source = 'gemini_reconciliation';
-                    merged.declarations.genericCommodityName.aiAssisted = true;
-                    merged.declarations.genericCommodityName.status = 'ai_assisted';
+                    const validation = validateFieldFormat('genericCommodityName', bc.genericName);
+                    if (validation.valid) {
+                        console.log(`[Reconciliation] Verified/overwriting genericCommodityName: "${merged.genericCommodityName}" -> "${bc.genericName}" via Gemini classification`);
+                        merged.genericCommodityName = bc.genericName;
+                        if (!merged.declarations.genericCommodityName) merged.declarations.genericCommodityName = { value: null };
+                        merged.declarations.genericCommodityName.value = bc.genericName;
+                        merged.declarations.genericCommodityName.source = 'gemini_reconciliation';
+                        merged.declarations.genericCommodityName.aiAssisted = true;
+                        merged.declarations.genericCommodityName.status = 'ai_assisted';
+                    } else {
+                        console.warn(`[Reconciliation] Format check rejected Gemini genericCommodityName: "${bc.genericName}" (${validation.reason})`);
+                    }
                 }
                 
                 console.log(`[Reconciliation] Brand classification applied: brand="${merged.brandName}", product="${merged.productName}", generic="${merged.genericCommodityName}"`);
             }
         } catch (err) {
             console.error('[Reconciliation] Gemini reconciliation failed:', err.message);
-            // Fallback: mark all pending fields as unresolved conflicts
+            // Fallback: mark conflicting pending fields as unresolved conflicts
             for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
+                if (candidates.length > 1) {
+                    const reconField = merged.reconciliation.fields[fieldName];
+                    if (reconField) reconField.status = 'unresolved_conflict';
+                    
+                    const conflictRecord = {
+                        field: fieldName,
+                        detectedValues: candidates.map(c => ({
+                            photo: c.photoId,
+                            value: c.value
+                        })),
+                        message: `Unresolved: different values detected across photos (Gemini unavailable)`,
+                        confirmedByGemini: false
+                    };
+                    merged.conflicts.push(conflictRecord);
+                    merged.reconciliation.conflicts.push(conflictRecord);
+                }
+            }
+        }
+    } else if (Object.keys(fieldsNeedingGemini).length > 0) {
+        console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) eligible for verification but Gemini is not available`);
+        for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
+            if (candidates.length > 1) {
                 const reconField = merged.reconciliation.fields[fieldName];
-                reconField.status = 'unresolved_conflict';
+                if (reconField) reconField.status = 'unresolved_conflict';
                 
                 const conflictRecord = {
                     field: fieldName,
@@ -1901,37 +1987,18 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         photo: c.photoId,
                         value: c.value
                     })),
-                    message: `Unresolved: different values detected across photos (Gemini unavailable)`,
+                    message: `Different values detected across photos (Gemini not configured)`,
                     confirmedByGemini: false
                 };
                 merged.conflicts.push(conflictRecord);
                 merged.reconciliation.conflicts.push(conflictRecord);
             }
         }
-    } else if (Object.keys(fieldsNeedingGemini).length > 0) {
-        // Gemini not available — mark as unresolved
-        console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) have conflicts but Gemini is not available`);
-        for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
-            const reconField = merged.reconciliation.fields[fieldName];
-            reconField.status = 'unresolved_conflict';
-            
-            const conflictRecord = {
-                field: fieldName,
-                detectedValues: candidates.map(c => ({
-                    photo: c.photoId,
-                    value: c.value
-                })),
-                message: `Different values detected across photos (Gemini not configured)`,
-                confirmedByGemini: false
-            };
-            merged.conflicts.push(conflictRecord);
-            merged.reconciliation.conflicts.push(conflictRecord);
-        }
     }
 
     merged.normalizedFields = { ...merged };
 
-    // Phase 5 Fix 2: Auto-apply Gemini fallback if imageBuffers were provided
+    // Phase 5 Fix 2: Auto-apply Gemini visual fallback if imageBuffers were provided
     if (imageBuffers && imageBuffers.length > 0) {
         return await applyGeminiFallback(merged, imageBuffers);
     }
@@ -1967,7 +2034,7 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
         });
     }
     
-    // Also check merged result for not_detected or unverified fields (Findings 3 & 4)
+    // Also check merged result for not_detected, low-confidence, or unverified fields (Findings 3 & 4)
     const fieldsToCheck = [
         { name: 'productName', val: mergedFields.productName },
         { name: 'brandName', val: mergedFields.brandName },
@@ -1987,7 +2054,8 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
         const declKey = name.split('.')[0];
         const decl = mergedFields.declarations?.[declKey];
         const isUnverified = !decl || decl.status !== 'verified';
-        if (!val || isUnverified) {
+        const isLowConfidence = typeof decl?.confidence === 'number' && decl.confidence < 0.85;
+        if (!val || isUnverified || isLowConfidence) {
             allLowConf.add(name);
         }
     });
@@ -1999,7 +2067,7 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
 
     console.log(`[Gemini Fallback] Attempting to recover ${fieldsToRead.length} field(s):`, fieldsToRead);
 
-    // Apply recovered values with AI-assisted provenance and confidence-based overwrite (Finding 1)
+    // Apply recovered values with AI-assisted provenance and confidence-based overwrite
     let recoveredCount = 0;
     const applyFallback = (fieldPath, value, reasoning, sourcePhrase) => {
         const parts = fieldPath.split('.');
@@ -2018,9 +2086,16 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
         const isUnverifiedDecl = !decl || decl.status !== 'verified';
         const isConflict = mergedFields.conflicts?.some(c => c.field === fieldPath || c.field === declKey);
 
-        // Overwrite policy: allow if falsy, low-confidence, unverified, or in conflict
-        if (isFalsy || isLowConf || isUnverifiedDecl || isConflict) {
-            // Grounding check for visual fallback (Finding 7)
+        // Shape/type validation gate
+        const formatCheck = validateFieldFormat(fieldPath, value);
+        if (!formatCheck.valid) {
+            console.warn(`[Gemini Fallback] Rejected invalid format for "${fieldPath}": "${value}" (${formatCheck.reason})`);
+            return;
+        }
+
+        // Overwrite policy: allow if falsy, low-confidence, unverified, in conflict, or date-shaped rejection
+        if (isFalsy || isLowConf || isUnverifiedDecl || isConflict || isDateShaped(currentVal)) {
+            // Grounding check for visual fallback
             let isGrounded = true;
             if (sourcePhrase && typeof sourcePhrase === 'string' && sourcePhrase.trim().length > 0) {
                 const normPhrase = sourcePhrase.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
@@ -2037,7 +2112,7 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
 
             if (fieldPath === 'mrp') {
                 const numVal = parseFloat(String(value).replace(/[^0-9.]/g, ''));
-                if (!isNaN(numVal) && numVal > 0) {
+                if (!isNaN(numVal) && numVal > 0 && numVal < 1000000) {
                     mergedFields.mrp = {
                         value: numVal,
                         currency: 'INR',
@@ -2046,7 +2121,7 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
                 }
             } else if (fieldPath === 'netQuantity') {
                 const nqm = String(value).match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-                if (nqm) {
+                if (nqm && isValidQuantityUnit(nqm[2])) {
                     mergedFields.netQuantity = {
                         value: parseFloat(nqm[1]),
                         unit: nqm[2].toLowerCase()
@@ -2130,5 +2205,9 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
 module.exports = {
     extractFields,
     mergeMultiPhotoExtractedFields,
-    applyGeminiFallback
+    applyGeminiFallback,
+    validateFieldFormat,
+    isValidQuantityUnit,
+    isDateShaped
 };
+
