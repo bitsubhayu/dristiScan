@@ -13,10 +13,13 @@ const generateToken = (payload, expiresIn = JWT_EXPIRY) => {
 };
 
 const setAuthCookie = (res, token, maxAgeMs = 7 * 24 * 60 * 60 * 1000) => {
+    const isProduction = process.env.NODE_ENV === 'production';
     res.cookie('token', token, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        // In cross-site production deployments (e.g. Vercel frontend + Cloud Run backend),
+        // sameSite must be 'none' paired with secure: true so browsers send cookies on cross-origin requests.
+        secure: isProduction,
+        sameSite: isProduction ? 'none' : 'lax',
         maxAge: maxAgeMs
     });
 };
@@ -238,8 +241,14 @@ const resetPassword = async (req, res) => {
 
 // POST /api/auth/logout
 const logout = (req, res) => {
-    res.clearCookie('token');
-    res.clearCookie('jwt');
+    const isProduction = process.env.NODE_ENV === 'production';
+    const clearCookieOptions = {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: isProduction ? 'none' : 'lax'
+    };
+    res.clearCookie('token', clearCookieOptions);
+    res.clearCookie('jwt', clearCookieOptions);
     res.json({ status: 'success', message: 'Logged out successfully.' });
 };
 
