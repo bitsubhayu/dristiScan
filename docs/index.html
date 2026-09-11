@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DrishtiScan — Project Report</title>
+  <meta name="description" content="DrishtiScan — Packaged-Commodity Compliance Scanner Technical Documentation and Project Report.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --primary: #1b4332;
+      --primary-hover: #143426;
+      --border: #e2e8f0;
+      --accent: #2d6a4f;
+      --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2.5rem 1.25rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 960px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.75rem;
+    }
+
+    header {
+      text-align: center;
+      padding: 2rem 1.5rem;
+      background: var(--card-bg);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+    }
+
+    .badge {
+      display: inline-block;
+      background: #e8f5e9;
+      color: var(--primary);
+      font-weight: 600;
+      font-size: 0.8125rem;
+      padding: 0.35rem 0.85rem;
+      border-radius: 9999px;
+      margin-bottom: 0.85rem;
+      letter-spacing: 0.025em;
+    }
+
+    h1 {
+      font-size: 2.125rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 0.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    p.subtitle {
+      font-size: 1.125rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-bottom: 1.25rem;
+    }
+
+    p.desc {
+      font-size: 0.9375rem;
+      color: var(--text-muted);
+      max-width: 680px;
+      margin: 0 auto 1.5rem auto;
+      line-height: 1.6;
+    }
+
+    .action-group {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.875rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.5rem;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: all 0.2s ease-in-out;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background-color: var(--primary);
+      color: #ffffff;
+      border: 1px solid var(--primary);
+      box-shadow: 0 2px 4px rgba(27, 67, 50, 0.2);
+    }
+
+    .btn-primary:hover {
+      background-color: var(--primary-hover);
+      border-color: var(--primary-hover);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background-color: #ffffff;
+      color: var(--text-main);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background-color: #f1f5f9;
+      border-color: #cbd5e1;
+      transform: translateY(-1px);
+    }
+
+    .viewer-card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.875rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: #fafafa;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .pdf-frame {
+      width: 100%;
+      height: 780px;
+      border: none;
+      background: #e2e8f0;
+    }
+
+    footer {
+      text-align: center;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      padding: 1rem 0;
+    }
+
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 500;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: 1.25rem 0.75rem;
+      }
+      h1 {
+        font-size: 1.625rem;
+      }
+      .pdf-frame {
+        height: 520px;
+      }
+      .viewer-header {
+        flex-direction: column;
+        gap: 0.5rem;
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">Official Technical Documentation</div>
+      <h1>DrishtiScan — Project Report</h1>
+      <p class="subtitle">Packaged-Commodity Compliance Scanner</p>
+      <p class="desc">
+        Comprehensive project documentation covering the end-to-end verification pipeline, structured field extraction, deterministic compliance rule engine, and deployment architecture.
+      </p>
+      <div class="action-group">
+        <a href="DrishtiScan_Project_Report.pdf" target="_blank" rel="noopener noreferrer" class="btn btn-primary" id="open-pdf-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+          Open PDF Report
+        </a>
+        <a href="DrishtiScan_Project_Report.pdf" download="DrishtiScan_Project_Report.pdf" class="btn btn-secondary" id="download-pdf-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          Download PDF
+        </a>
+      </div>
+    </header>
+
+    <div class="viewer-card">
+      <div class="viewer-header">
+        <span>Document Preview: DrishtiScan_Project_Report.pdf (8 pages)</span>
+        <span>Repository: <a href="https://github.com/bitsubhayu/dristiScan" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">bitsubhayu/dristiScan</a></span>
+      </div>
+      <iframe class="pdf-frame" src="DrishtiScan_Project_Report.pdf" title="DrishtiScan Project Report PDF Preview"></iframe>
+    </div>
+
+    <footer>
+      DrishtiScan Project Report &bull; Source Repository: <a href="https://github.com/bitsubhayu/dristiScan" target="_blank" rel="noopener noreferrer">github.com/bitsubhayu/dristiScan</a>
+    </footer>
+  </div>
+</body>
+</html>
