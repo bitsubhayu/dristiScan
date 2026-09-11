@@ -13,13 +13,40 @@ const app = express();
 const port = parseInt(process.env.PORT, 10) || 8080;
 const host = '0.0.0.0';
 
-// Phase 6 (Audit Fix): Configurable CORS origins via environment variable
-const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map(o => o.trim())
-    : ['http://localhost:5173', 'http://127.0.0.1:5173'];
+// Phase 6 (Audit & Cross-Origin Fix): Configurable CORS origins with explicit rejection logging
+const normalizeOrigin = (o) => (o ? o.trim().replace(/\/+$/, '') : '');
+
+const defaultOrigins = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://frontend-bitsubhayus-projects.vercel.app',
+    'https://frontend-git-main-bitsubhayus-projects.vercel.app',
+    'https://frontend-nnaxpe7h4-bitsubhayus-projects.vercel.app'
+];
+
+const envOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map(normalizeOrigin).filter(Boolean)
+    : [];
+
+// Deduplicated list of allowed origins (environment variable takes precedence, default fallback included)
+const corsOrigins = Array.from(new Set([...envOrigins, ...defaultOrigins.map(normalizeOrigin)]));
 
 app.use(cors({
-    origin: corsOrigins,
+    origin: (origin, callback) => {
+        // Allow requests with no origin (such as server-to-server health checks, curl, mobile clients)
+        if (!origin) {
+            return callback(null, true);
+        }
+
+        const normalizedIncoming = normalizeOrigin(origin);
+        if (corsOrigins.includes(normalizedIncoming)) {
+            return callback(null, true);
+        }
+
+        // Explicit server-side visibility into CORS rejections for rapid Cloud Run diagnostics
+        console.warn(`[CORS REJECTED] Origin "${origin}" is not allowed by CORS_ORIGINS. Allowed list:`, corsOrigins);
+        return callback(null, false);
+    },
     credentials: true
 }));
 app.use(cookieParser());
