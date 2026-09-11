@@ -31,12 +31,16 @@ const scan = async (req, res) => {
         // Initialize comprehensive debug tracker for this scan
         const tracker = createScanTracker('officer', imageFiles);
 
-        // 1. Run OCR on each uploaded photo
+        // 1. Run OCR on each uploaded photo concurrently
+        const ocrResults = await Promise.all(
+            imageFiles.map(file => runOCR(file.buffer, file.originalname, file.mimetype))
+        );
+
         const singlePhotoExtractions = [];
         for (let i = 0; i < imageFiles.length; i++) {
             const file = imageFiles[i];
             const sourceImageId = `photo-${i + 1}`;
-            const ocrResult = await runOCR(file.buffer, file.originalname, file.mimetype);
+            const ocrResult = ocrResults[i];
             tracker.recordOcrResult(i + 1, ocrResult);
 
             // Section 2: Stop immediately if OCR fails — never silently produce empty reports
