@@ -53,6 +53,18 @@ router.post('/scan', scanLimiter, upload.fields([
             const sourceImageId = `photo-${i + 1}`;
             const ocrResult = await runOCR(file.buffer, file.originalname, file.mimetype);
             tracker.recordOcrResult(i + 1, ocrResult);
+
+            // Section 2: Stop immediately if OCR fails — never silently produce empty reports
+            if (ocrResult.success === false) {
+                console.error(`[Consumer Scan] OCR failed for photo ${i + 1}: ${ocrResult.error}`);
+                return res.status(503).json({
+                    status: 'error',
+                    error: 'OCR service temporarily unavailable — please try again in a moment.',
+                    detail: `Photo ${i + 1} ("${file.originalname}") failed OCR: ${ocrResult.error}`,
+                    scanId: tracker.scanId
+                });
+            }
+
             const fields = extractFields(ocrResult, sourceImageId);
             singlePhotoExtractions.push(fields);
         }
