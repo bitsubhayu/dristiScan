@@ -31,7 +31,7 @@ const runOCR = async (imageBuffer, originalname = 'label.jpg', mimetype = 'image
                 'Content-Length': formBuffer.length
             },
             httpAgent: ipv4Agent,
-            timeout: 120000, // 120 seconds to allow thorough CPU inference on large packaging photos
+            timeout: 300000, // 300 seconds to allow thorough CPU inference on large packaging photos
             maxBodyLength: Infinity,
             maxContentLength: Infinity
         });
