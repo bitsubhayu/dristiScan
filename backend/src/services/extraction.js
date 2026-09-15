@@ -878,7 +878,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     if (sizeMatch) {
         let rawSize = sizeMatch[1].trim();
         // Bug 3 fix: Truncate at field boundaries — stop before nutrition table, how-to-use, storage, etc.
-        const truncateAt = rawSize.search(/\b(?:Energy|Protein|Fat|Carbohydrate|Sugar|Sodium|Fiber|Calories|kcal|How\s*to|Directions|Storage|Store|Keep\s*in|Nutrition|Amount\s*Per|Daily\s*Value|\d+(?:\.\d+)?\s*(?:kcal|mg|mcg))\b/i);
+        const truncateAt = rawSize.search(/\b(?:Per\s*Serving|Quantity|%?\s*RDA|Energy|Protein|Fat|Carbohydrate|Sugar|Sodium|Fiber|Calories|kcal|How\s*to|Directions|Storage|Store|Keep\s*in|Nutrition|Amount\s*Per|Daily\s*Value|\d+(?:\.\d+)?\s*(?:kcal|mg|mcg))\b/i);
         if (truncateAt > 0) {
             rawSize = rawSize.substring(0, truncateAt).trim();
         }
@@ -1191,10 +1191,19 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // 10. Ingredients List
     // -------------------------------------------------------------
     let ingredientsText = null;
-    const ingRegex = /(?:Ingredients|INGREDIENTS|NGEDIENTS)\s*[:.-]?\s*([\s\S]+?)(?=(?:Nutrition|NUTRITION|Allergen|ALLERGEN|Mfg|MFG|Best Before|Batch|$))/i;
+    const ingRegex = /(?:Ingredients|INGREDIENTS|NGEDIENTS|INGREDENTS)\s*[:.-]?\s*([\s\S]+?)(?=(?:Nutrition|NUTRITION|Allergen|ALLERGEN|Mfg|MFG|Best Before|Batch|$))/i;
     const ingMatch = fullText.match(ingRegex);
     if (ingMatch) {
-        ingredientsText = ingMatch[1].trim().replace(/\s+/g, ' ');
+        const rawIng = ingMatch[1].trim().replace(/\s+/g, ' ');
+        // Validate that captured text represents a substantive ingredients declaration:
+        // Reject isolated additive codes (e.g., "INS 4201 P"), truncated fragments, or noise lacking actual food ingredients
+        const words = rawIng.replace(/[^a-zA-Z\s]/g, ' ').trim().split(/\s+/).filter(Boolean);
+        const substantiveWords = words.filter(w => w.length >= 3 && !/^ins$/i.test(w));
+        const isAdditiveOrNoiseFragment = /^[([{\s]*INS\s*\d+/i.test(rawIng) || /^(?:additive|preservative|humectant)\b/i.test(rawIng);
+
+        if (rawIng.length >= 4 && substantiveWords.length >= 1 && !isAdditiveOrNoiseFragment) {
+            ingredientsText = rawIng;
+        }
     }
     declarations.ingredients = {
         value: ingredientsText,
@@ -1233,18 +1242,22 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // Evaluate candidate lines only if they represent affirmative product titles
     const candidateTitleLines = rawElements.filter(el => {
         const tr = el.text.trim();
-        if (isDateShaped(tr) || isMarketingBadge(tr)) return false;
+        if (isDateShaped(tr) || isMarketingBadge(tr) || !/[a-zA-Z]{3,}/.test(tr)) return false;
 
         // Ban non-title content (nutrition, ingredients, dates, prices, addresses, etc.)
-        const isDisallowed = /^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommended|for feedback|customer|bath|lot|date|values|rda|sugar|sodium|mg|kcal|tablets|capsules|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|website)/i.test(tr) ||
-            /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|online)\b/i.test(tr) ||
+        const isDisallowed = /^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|pkd|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommen|for feedback|customer|bath|lot|date|values|%?\s*rda|sugar|sodium|sodlum|cholesterol|tablets?|capsules?|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|vist|website|allergen|total|fish|guideline|council|processed|all\s*taxes)/i.test(tr) ||
+            /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr) ||
+            /\b(?:kcal|cal|mg|mcg|g|ml|kg)\b/i.test(tr) ||
+            /(?:ceutical|nutraceutical|supplement)\b/i.test(tr) ||
+            /servings?\b/i.test(tr) ||
+            /\b(?:and|or|for|with|in|of)$/i.test(tr) ||
+            /^[\s\-_•*~]/.test(tr) ||
             /^[a-z]{1,8}$/.test(tr) || // Reject single short all-lowercase fragment
             /^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(tr) ||
             textDateRegex.test(tr) ||
             /^[A-Z]{2,6}\d{4,10}$/i.test(tr) ||
-            /^\d+(?:\.\d+)?$/.test(tr) ||
-            /^\d+\.\d{2}$/.test(tr) ||
-            /\d{2}:\d{2}/.test(tr) ||
+            /^[^\w\s]*\d+(?:\.\d+)?(?:\s*(?:kcal|mg|g|%|mcg))?[^\w\s]*$/.test(tr) ||
+            /^\+?\d+[\d\s-]+$/.test(tr) ||
             tr === batchVal ||
             (mrpVal && (tr === mrpVal.toString() || tr === mrpVal.toFixed(2))) ||
             /^\d{2,5}\.\d{2}$/.test(tr);
@@ -1292,11 +1305,16 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     const brandCandidates = rawElements.filter(el => {
         const tr = el.text.trim();
         // Must be 2-40 chars, not a known non-brand pattern
-        if (tr.length < 2 || tr.length > 40) return false;
+        if (tr.length < 3 || tr.length > 40) return false;
         // Must not be a marketing badge or date-shaped
         if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
         // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
-        if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|sugar|sodium|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution)/i.test(tr)) return false;
+        if (/^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|quantity|energy|protein|fat|carbohydrate|sugar|sodium|sodlum|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution|recommen|customer|feedback|processed|total|fish)/i.test(tr)) return false;
+        if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr)) return false;
+        if (/servings?\b/i.test(tr)) return false;
+        if (/(?:ceutical|nutraceutical|supplement)\b/i.test(tr)) return false;
+        if (/\b(?:and|or|for|with|in|of)$/i.test(tr)) return false;
+        if (/^\+?\d+[\d\s-]+$/.test(tr)) return false;
         // Must not be a date, number-only, or batch code
         if (/^\d+(?:\.\d+)?$/.test(tr)) return false;
         if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return false;
