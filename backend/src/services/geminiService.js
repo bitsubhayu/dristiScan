@@ -211,9 +211,9 @@ const reconcileFields = async (candidatesByField, allOcrFragments = []) => {
     const prompt = `You are a product label analysis assistant. Photos were taken of a physical product package. The OCR system extracted text fragments for various declarations.
 
 IMPORTANT FIELD DEFINITIONS — these are THREE SEPARATE identity declarations, not competing answers:
-- brandName: The company/manufacturer trade name (e.g. "NUTRABOX", "Optimum Nutrition", "Nestle"). This is the brand, NOT the product.
-- productName: The specific product or variant name (e.g. "The Alpha Creatine (Unflavoured)", "Gold Standard 100% Whey", "Maggi 2-Minute Noodles"). This is the marketing name of this specific product.
-- genericCommodityName: The common/generic name of the commodity as required by Legal Metrology (e.g. "Micronized Creatine Monohydrate", "Whey Protein Isolate", "Instant Noodles"). This is what the product IS, generically.
+- brandName: The trade name, brand mark, or house mark under which the product line is sold (the manufacturer or commercial brand identity). This is the brand, NOT the specific variant title.
+- productName: The specific product or variant title (the commercial marketing title, formulation, or variant name). This is the specific product, NOT the overall brand name.
+- genericCommodityName: The standard generic descriptive name of the commodity as required by Legal Metrology (the common noun classification of the good — what the product IS generically).
 
 All three can legitimately be different — they are NOT conflicts with each other.
 
@@ -317,9 +317,9 @@ const fallbackReadFields = async (imageBuffer, fieldsToRead = [], mimeType = 'im
 
     // Map field names to human-readable descriptions for the prompt
     const FIELD_DESCRIPTIONS = {
-        'productName': 'the specific product/variant name (the marketing name, NOT the brand — e.g. "Gold Standard 100% Whey", "The Alpha Creatine (Unflavoured)")',
-        'brandName': 'the brand/company trade name (e.g. "NUTRABOX", "Optimum Nutrition") — NOT the product name, NOT marketing badges like "100% Authentic"',
-        'genericCommodityName': 'the common/generic commodity name as required by Legal Metrology (e.g. "Creatine Monohydrate", "Whey Protein Isolate", "Tomato Ketchup") — what the product IS generically',
+        'productName': 'the specific commercial variant title or product marketing name (NOT the company brand trade name)',
+        'brandName': 'the manufacturer or commercial brand trade name — NOT the specific variant title, NOT marketing badges like "100% Authentic"',
+        'genericCommodityName': 'the common or generic commodity descriptor as required by Legal Metrology (the common noun classification — what the product IS generically)',
         'manufacturer.name': 'the manufacturer name (look for "Manufactured By" or "Mfd. By")',
         'manufacturer.address': 'the manufacturer or marketer full address',
         'marketer.name': 'the marketer name (look for "Marketed By")',

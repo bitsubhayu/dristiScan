@@ -10,6 +10,7 @@
  */
 
 const geminiService = require('./geminiService');
+const gptOssService = require('./gptOssService');
 
 /**
  * Phase 6 (Audit Fix): Named confidence threshold for deciding when a field
@@ -34,8 +35,11 @@ const GEMINI_FALLBACK_CONFIDENCE_THRESHOLD = parseFloat(
 const isDateShaped = (text) => {
     if (!text || typeof text !== 'string') return false;
     const s = text.trim();
+    if (s.length < 3) return false;
+    if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(s)) return true;
     if (s.length < 4) return false;
-    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(s)) return true;
+    if (/\d{1,2}:\d{2}/.test(s)) return true;
+    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(s)) return true;
     if (/\b\d{1,2}[/]\d{2,4}\b/.test(s)) return true;
     if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
     if (/\b\d{1,2}[\s./-]+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
@@ -310,6 +314,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     let resultsArray = ocrResults;
     if (ocrResults && ocrResults.results) {
         resultsArray = ocrResults.results;
+    } else if (ocrResults && ocrResults.rawElements) {
+        resultsArray = ocrResults.rawElements;
     }
     if (!Array.isArray(resultsArray)) {
         resultsArray = [];
@@ -407,8 +413,13 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
                     // Filter by value type
                     const candText = candidate.text.trim();
-                    if (valueType === 'price' && !/\d+(?:\.\d+)?/.test(candText)) continue;
-                    if (valueType === 'quantity' && !/\d/.test(candText)) continue;
+                    if (valueType === 'price') {
+                        if (!/\d+(?:\.\d+)?/.test(candText)) continue;
+                        if (isDateShaped(candText) || /\d{1,2}:\d{2}/.test(candText) || /^[+\d\s\-().]{7,25}$/.test(candText)) continue;
+                    }
+                    if (valueType === 'quantity') {
+                        if (!/\d/.test(candText) || isDateShaped(candText)) continue;
+                    }
 
                     // Check spatial proximity: to the right (same line) or directly below
                     const dx = candCenter.x - labelCenter.x;
@@ -781,9 +792,10 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         for (let i = 0; i < rawElements.length; i++) {
             const el = rawElements[i];
             if (/^(?:M\.?\s*R\.?\s*P\.?|MRP)\s*[:.-]?\s*$/i.test(el.text.trim())) {
-                // Look at next 3 elements for a price value
-                for (let j = 1; j <= 3 && i + j < rawElements.length; j++) {
+                // Look at next 5 elements for a price value, skipping dates, USP, and phone numbers
+                for (let j = 1; j <= 5 && i + j < rawElements.length; j++) {
                     const candText = rawElements[i + j].text.trim();
+                    if (isDateShaped(candText) || /usp|cap|unit\s*sale/i.test(candText) || /^[+\d\s\-().]{7,25}$/.test(candText)) continue;
                     const priceMatch = candText.match(/(?:Rs\.?|₹)?\s*(\d{2,6}(?:\.\d{2})?)/);
                     if (priceMatch) {
                         const num = parseFloat(priceMatch[1]);
@@ -970,6 +982,25 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
+    // Pattern D: Embedded standard metric weight/volume in multi-declaration lines (e.g. "20 FL OZ (1.25 PT) 591 mL")
+    if (!netQtyVal) {
+        const embeddedMetricRegex = /\b(\d+(?:\.\d+)?)\s*(ml|mls|g|gm|gms|kg|kgs|l|lt|ltr)\b/i;
+        for (let i = 0; i < rawElements.length; i++) {
+            const el = rawElements[i];
+            if (/per\s*serving|amount\s*per|nutrition|sodium|protein|fat|carb|energy|kcal|sugars?|cholesterol/i.test(el.text)) continue;
+            const emm = el.text.match(embeddedMetricRegex);
+            if (emm) {
+                const num = parseFloat(emm[1]);
+                if (num >= 5) {
+                    netQtyVal = num;
+                    netQtyUnit = emm[2].toLowerCase();
+                    netQtyElem = el;
+                    break;
+                }
+            }
+        }
+    }
+
     const isUnitValid = netQtyVal !== null && isValidQuantityUnit(netQtyUnit);
     declarations.netQuantity = {
         value: netQtyVal,
@@ -1080,7 +1111,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    // Match prominent corporate entity declarations (e.g. "THE COCA-COLA COMPANY")
+    // Match prominent corporate entity declarations (e.g. "THE BEVERAGE COMPANY")
     if (!mfrName && !mktName) {
         for (let i = 0; i < rawElements.length; i++) {
             const el = rawElements[i];
@@ -1213,7 +1244,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     if (fatMatch) nutritionFacts.fat = parseFloat(fatMatch[1]);
     const sugarMatch = fullText.match(/(?:Total Sugars|Sugars|Sugar|Added Sugars)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
     if (sugarMatch) nutritionFacts.sugar = parseFloat(sugarMatch[1]);
-    const sodiumMatch = fullText.match(/(?:Sodium|Sodlum|Salt)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*(mg|g)/i);
+    const sodiumMatch = fullText.match(/(?:Sod[il1]um|Salt)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*(mg|g)/i);
     if (sodiumMatch) {
         const v = parseFloat(sodiumMatch[1]);
         nutritionFacts.sodium = sodiumMatch[2].toLowerCase() === 'g' ? v * 1000 : v;
@@ -1230,42 +1261,165 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     let prodName = null;
     let prodNameElem = null;
 
-    // Evaluate candidate lines only if they represent affirmative product titles
-    const candidateTitleLines = rawElements.filter(el => {
+    const COMMODITY_NOUNS = /\b(?:oil|whey|protein|creatine|capsules?|tablets?|softgels?|syrup|sauce|ketchup|juice|drink|tea|coffee|biscuit|cookies?|snack|chips|noodles|pasta|flour|atta|rice|dal|salt|sugar|water|cola|soda|paste|spread|jam|butter|ghee|paneer|cheese|milk|curd|yogurt|cereal|oats|muesli|honey|vinegar|shampoo|soap|wash|lotion|cream|powder)\b/i;
+
+    const isNonProductTitleCandidate = (rawText) => {
+        if (!rawText || typeof rawText !== 'string') return true;
+        const tr = rawText.trim();
+        if (tr.length < 2 || tr.length > 70) return true;
+
+        // 1. Single character or isolated symbols
+        if (/^[^\w\s]+$/.test(tr) || tr.length === 1) return true;
+
+        // 2. Pure digits, decimals, times, pure punctuation, or phone numbers
+        if (/^\d+(?:\.\d+)?$/.test(tr)) return true;
+        if (/^\d+\.\d{2}$/.test(tr)) return true;
+        if (/\d{1,2}:\d{2}/.test(tr)) return true;
+        if (/^[+\d\s\-().]{7,25}$/.test(tr)) return true;
+
+        // 3. Quantities, dosages, servings, counts, and standalone units:
+        if (/^\s*\d+(?:\.\d+)?\s*(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|cl|oz|fl\s*oz|pt|kcal|tablets?|capsules?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|servings?|count|ct)\b/i.test(tr)) return true;
+        if (/^\s*(?:approx\.?\s*)?\d+(?:\.\d+)?\s*(?:mg|g|ml|kg|l)\b/i.test(tr)) return true;
+        if (/^\s*(?:\d+\s*)?(?:capsules?|tablets?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|scoop)[:.-]?$/i.test(tr)) return true;
+        if (/^\s*(?:\d+\s*)?(?:servings?|servings?\s*per\s*container)[:.-]?/i.test(tr)) return true;
+        if (/servings?$/i.test(tr)) return true;
+        if (/^\d+\s*Capsule\s*\(/i.test(tr)) return true;
+
+        const withoutNum = tr.replace(/[\d.,+\-/()%\s]/g, '').toLowerCase();
+        if (withoutNum.length > 0 && /^(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|oz|pt|kcal|mcg|tablets?|capsules?|softgels?|servings?)$/i.test(withoutNum)) return true;
+
+        // 4. Prices, taxes, and currency:
+        if (/[₹$€£]/.test(tr)) return true;
+        if (/\b(?:rs\.?|inr)\s*[:.-]?\s*\d+/i.test(tr)) return true;
+        if (/\b(?:mrp|usp|unit\s*sale\s*price|max\s*retail)\b/i.test(tr)) return true;
+        if (/\b\d+(?:\.\d+)?\s*\/\s*(?:cap|tab|g|kg|ml|unit|pc|piece)\b/i.test(tr)) return true;
+        if (/\b(?:taxes?|tax\b|incl\.?\s*of|inclusive\s*of)\b/i.test(tr)) return true;
+        if (/^\(?cincl\.?of/i.test(tr)) return true;
+
+        // 5. Dates, months, timestamps, and packaging codes:
+        if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(tr)) return true;
+        if (/\b\d{1,2}[/]\d{2,4}\b/.test(tr)) return true;
+        if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]*\d{2,4}\b/i.test(tr)) return true;
+        if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return true;
+        if (/\b(?:mfg|pkd|exp|expiry|best\s*before|use\s*by|packed\s*on)\b/i.test(tr)) return true;
+
+        // 6. Batch / Lot / Serial numbers:
+        if (/\b(?:batch|lot|b\.?\s*no\.?)\b/i.test(tr)) return true;
+        if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return true;
+        if (/^B\d{4,}$/i.test(tr)) return true;
+
+        // 7. Regulatory, Licenses, Standards, Barcodes:
+        if (/\b(?:fssai|lic\.?\s*no\.?|license)\b/i.test(tr)) return true;
+        if (/^\d{14}$/.test(tr)) return true;
+        if (/\d{5,}"\d{5,}/.test(tr)) return true;
+        if (/\b(?:ICMR|RDA|WHO|GMP|ISO|HACCP)\b/i.test(tr)) return true;
+        if (/percent\s*rda|guideline\s*2020|medical\s*research/i.test(tr)) return true;
+
+        // 8. Additives, INS numbers, Excipients:
+        if (/INS\s*\d+/i.test(tr)) return true;
+        if (/\b(?:preservative|humectant|emulsifier|stabilizer|thickener|acidity\s*regulator|anti-caking)\b/i.test(tr)) return true;
+        if (/^-\s*(?:monounsaturated|polyunsaturated|saturated|trans\s*fat|cholesterol|epa|dha)/i.test(tr)) return true;
+
+        // 9. Nutrition panel & Ingredients headers/rows:
+        if (/^(?:nutrition\s*(?:information|facts)?|nutritional\s*information|supplement\s*facts|ingredients?|ingredents?|ngedients?)\s*[:.-]?$/i.test(tr)) return true;
+        if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?\s*(?:\d|<|>|nil|trace|none|\bper\b|\bamount\b|\bg\b|\bmg\b|\bkcal\b)/i.test(tr)) return true;
+        if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?$/i.test(tr)) return true;
+        if (/\b(?:per\s*serving|amount\s*per\s*serving|daily\s*value|\bper\s*100g?\b)\b/i.test(tr)) return true;
+        if (/^allergens?\b/i.test(tr)) return true;
+
+        // 10. Contact, Customer care, URLs, Phones, Feedback:
+        if (/^(?:customer|consumer|client)\b/i.test(tr)) return true;
+        if (/\b(?:customer\s*care|consumer\s*care|for\s*feedback|helpline|toll\s*free|call\s*1-|call\s*\+91)\b/i.test(tr)) return true;
+        if (/\b(?:https?:\/\/|www\.|\.(?:com|org|net|in|co|gov|edu)\b)/i.test(tr)) return true;
+        if (/^(?:visit|check|browse|follow|refer\s*to)\s+(?:us|our|online|website|at|for|more)?\b/i.test(tr)) return true;
+
+        // 11. Storage instructions & Disclaimers:
+        if (/\b(?:store\s*in|keep\s*in|cool\s*and\s*dry|direct\s*sunlight|keep\s*out\s*of\s*reach|how\s*to\s*use|directions?\s*for\s*use)\b/i.test(tr)) return true;
+        if (/\b(?:not\s*for\s*medicinal|not\s*to\s*exceed|consult\s*your)\b/i.test(tr)) return true;
+
+        // 12. Corporate suffixes, Legal clauses, Manufacturing notes, and Sentence fragments:
+        if (/[,;.]$/.test(tr)) return true; // Sentence fragments ending with punctuation
+        if (/^(?:for|to|and|with|our|from|in|on|at|by|of)\s+/i.test(tr)) return true; // Prepositional phrases
+        if (/\b(?:feedback|customer|consumer|our\s*products?)\b/i.test(tr)) return true;
+        if (/^(?:the|and|or|for|with|from|this|that|these|those|our|your|their|are|was|were|been|have|has|had|not|can|may|will|would|should|could|online)$/i.test(tr)) return true; // Isolated stop words
+        if (/^(?:ation|tion|sion|ment|ties|ness|able|ible|ised|ized|tured|ing|ed)$/i.test(tr)) return true; // Isolated morphemes / clipped suffixes
+        if (/\b(?:manufactured\s*by|marketed\s*by|packed\s*by|imported\s*by|mfd\.?\s*by|pkd\.?\s*by|made\s*in\b)/i.test(tr)) return true;
+        if (/\b(?:is|are|was|were|been|being)\s+(?:manufactured|packed|marketed|distributed|produced|formulated|made|bottled|processed)\b/i.test(tr)) return true; // Passive manufacturing clauses
+        if (/\b(?:recycle|recyclable|no\s*refill|please\s*recycle|crush\s*the\s*bottle|dispose\s*of)\b/i.test(tr)) return true; // Generic packaging handling directives
+        if (/\b(?:proof\s*of\s*purch(?:ase)?|code\s*under\s*(?:the\s*)?cap|scratch\s*code|scan\s*qr|scan\s*to\s*win)\b/i.test(tr)) return true; // Generic consumer packaging promotions
+        if (/^(?:share|enjoy|taste|try|feel|drink|serve|refresh)\s+(?:a|an|the|our|this)\b/i.test(tr)) return true; // Generic imperative marketing slogans
+        if (/^[a-z0-9\s]+:$/i.test(tr)) return true;
+
+        return false;
+    };
+
+    const scoreProductCandidate = (elem) => {
+        const text = elem.text.trim();
+        let score = 0;
+
+        score += (elem.confidence || 0.8) * 15;
+
+        const heights = rawElements.map(e => {
+            if (!e.bbox || e.bbox.length < 4) return 20;
+            const ys = e.bbox.map(p => p[1]);
+            return Math.max(...ys) - Math.min(...ys);
+        }).filter(h => h > 5);
+        heights.sort((a, b) => a - b);
+        const medianHeight = heights.length > 0 ? heights[Math.floor(heights.length / 2)] : 20;
+        
+        let elemHeight = 20;
+        let elemCenterY = 0;
+        if (elem.bbox && elem.bbox.length >= 4) {
+            const ys = elem.bbox.map(p => p[1]);
+            elemHeight = Math.max(...ys) - Math.min(...ys);
+            elemCenterY = (Math.max(...ys) + Math.min(...ys)) / 2;
+        }
+        const heightRatio = elemHeight / medianHeight;
+        score += Math.min(heightRatio, 3.5) * 10;
+
+        const words = text.split(/\s+/);
+        if (words.length >= 2 && words.length <= 6) score += 20;
+        else if (words.length === 1) score += 8;
+        else if (words.length > 6) score -= 15;
+
+        if (/^[A-Z][a-z0-9%]+(?:\s+[A-Z0-9%][a-z0-9%]*)*$/.test(text)) score += 10;
+        else if (/^[A-Z0-9\s&'%.-]+$/.test(text)) score += 8;
+
+        if (COMMODITY_NOUNS.test(text)) score += 25;
+
+        const maxImgY = Math.max(...rawElements.flatMap(e => (e.bbox || []).map(p => p[1])), 1000);
+        if (elemCenterY > 0 && maxImgY > 0) {
+            const relY = elemCenterY / maxImgY;
+            if (relY < 0.60) score += 10;
+            else if (relY > 0.80) score -= 10;
+        }
+
+        return { text, score, heightRatio, elemHeight };
+    };
+
+    // Filter valid title candidates using strict rejection gate
+    const validTitleCandidates = rawElements.filter(el => {
         const tr = el.text.trim();
         if (isDateShaped(tr) || isMarketingBadge(tr)) return false;
-
-        // Ban non-title content (nutrition, ingredients, dates, prices, addresses, etc.)
-        const isDisallowed = /^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommended|for feedback|customer|bath|lot|date|values|rda|sugar|sodium|mg|kcal|tablets|capsules|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|website)/i.test(tr) ||
-            /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|online)\b/i.test(tr) ||
-            /^[a-z]{1,8}$/.test(tr) || // Reject single short all-lowercase fragment
-            /^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(tr) ||
-            textDateRegex.test(tr) ||
-            /^[A-Z]{2,6}\d{4,10}$/i.test(tr) ||
-            /^\d+(?:\.\d+)?$/.test(tr) ||
-            /^\d+\.\d{2}$/.test(tr) ||
-            /\d{2}:\d{2}/.test(tr) ||
-            tr === batchVal ||
-            (mrpVal && (tr === mrpVal.toString() || tr === mrpVal.toFixed(2))) ||
-            /^\d{2,5}\.\d{2}$/.test(tr);
-        return !isDisallowed && tr.length >= 4 && tr.length <= 50;
+        if (isNonProductTitleCandidate(tr)) return false;
+        return tr.length >= 3 && tr.length <= 60;
     });
 
-    // Only accept if line is not an ingredient snippet and is a plausible title
-    if (candidateTitleLines.length > 0) {
-        const topCandidate = candidateTitleLines.find(c => {
-            const tr = c.text.trim();
-            if (/gelling agent|edible oil|preservatives|contain|storage|keep in|manufactured/i.test(tr)) return false;
-            if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured)$/i.test(tr)) return false;
-            return tr.split(/\s+/).length >= 2 || tr.length >= 6;
-        });
-        if (topCandidate) {
-            prodName = topCandidate.text.trim();
-            prodNameElem = topCandidate;
+    if (validTitleCandidates.length > 0) {
+        const scoredCandidates = validTitleCandidates.map(c => ({
+            candidate: c,
+            ...scoreProductCandidate(c)
+        }));
+        scoredCandidates.sort((a, b) => b.score - a.score);
+
+        // Require confidence threshold score of at least 60
+        if (scoredCandidates[0].score >= 60) {
+            prodName = scoredCandidates[0].candidate.text.trim();
+            prodNameElem = scoredCandidates[0].candidate;
         }
     }
 
-    if (prodName && (isDateShaped(prodName) || isMarketingBadge(prodName))) {
+    if (prodName && (isDateShaped(prodName) || isMarketingBadge(prodName) || isNonProductTitleCandidate(prodName))) {
         prodName = null;
         prodNameElem = null;
     }
@@ -1291,12 +1445,24 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // Strategy B: Find prominent uppercase text that looks like a brand
     const brandCandidates = rawElements.filter(el => {
         const tr = el.text.trim();
-        // Must be 2-40 chars, not a known non-brand pattern
-        if (tr.length < 2 || tr.length > 40) return false;
+        // Must be 4-40 chars, not a known non-brand pattern
+        if (tr.length < 4 || tr.length > 40) return false;
         // Must not be a marketing badge or date-shaped
         if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
+        // Exclude month abbreviations
+        if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return false;
+        // Exclude generic corporate entities
+        if (/^(?:COMPANY|CORP|CORPORATION|LIMITED|LTD|PVT|LLC|INC)$/i.test(tr)) return false;
+        // Exclude sectional noise, regulatory categories, and fragmented clauses
+        if (/servings?$/i.test(tr) || /ingredients?$/i.test(tr) || /ingredents?$/i.test(tr) || /ceutical/i.test(tr)) return false;
+        if (/\b(?:and|or|with|of|for|the|in|on|at|to)$/i.test(tr)) return false;
+        if (/^(?:and|or|with|of|for|the|in|on|at|to)\b/i.test(tr)) return false;
+        if (/\b(?:heart|skin|joints?|bones?|immunity|brain|eyes?|hair|muscle)\b/i.test(tr)) return false;
         // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
-        if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|sugar|sodium|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution)/i.test(tr)) return false;
+        if (/\b(?:fat|sugars?|carbohydrates?|protein|energy|cholesterol|potassium|calcium|iron|vitamin|mineral|capsules?|tablets?|softgels?|nutraceutical|rda)\b/i.test(tr)) return false;
+        if (/\b(?:sod[il1]um|potass[il1]um|calc[il1]um|magn[il1]es[il1]um)\b/i.test(tr)) return false;
+        if (/\b(?:total|added|trans|saturated|monounsaturated|polyunsaturated)\b/i.test(tr)) return false;
+        if (/^(?:nutrition|ingredients?|ngedients?|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings?|quantity|energy|protein|fat|carbohydrate|sugar|sod[il1]um|cholesterol|acid|fatty|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions?|storage|store|keep|allergen|warning|caution|recommen|usage|dosage|suggested|guideline|supplement|customer|consumer|care|contact|feedback|process|facility|manufactur|product|contain|council|percent|table|approx|capsule|tablet|softgel|bottle|pack)/i.test(tr)) return false;
         // Must not be a date, number-only, or batch code
         if (/^\d+(?:\.\d+)?$/.test(tr)) return false;
         if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return false;
@@ -1318,26 +1484,43 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (matchingCandidate) {
             brandNameVal = matchingCandidate.text.trim();
             brandNameElem = matchingCandidate;
+        } else {
+            // Strategy A.2: Derive brand directly from corporate party name (e.g. "THE BEVERAGE COMPANY" -> "Beverage")
+            const cleanPartyBrand = possibleBrandFromParty
+                .replace(/^(?:the|©?\s*\d{4})\s+/i, '')
+                .replace(/\s+(?:company|corp|corporation|ltd|limited|pvt|llc|inc)\b.*/i, '')
+                .trim();
+            if (cleanPartyBrand.length >= 3 && !isMarketingBadge(cleanPartyBrand) && !isDateShaped(cleanPartyBrand)) {
+                brandNameVal = cleanPartyBrand;
+                brandNameElem = mfrElem;
+            }
         }
     }
-    // Fallback: use the most prominent candidate by bbox area
+    // Fallback: use the most prominent candidate by bbox area (must have display-heading prominence)
     if (!brandNameVal && brandCandidates.length > 0) {
+        const elemHeights = rawElements.map(e => {
+            if (!e.bbox || e.bbox.length < 4) return 20;
+            const ys = e.bbox.map(p => p[1]);
+            return Math.max(...ys) - Math.min(...ys);
+        }).filter(h => h > 5);
+        elemHeights.sort((a, b) => a - b);
+        const medianH = elemHeights.length > 0 ? elemHeights[Math.floor(elemHeights.length / 2)] : 20;
+
         let bestArea = 0;
         for (const c of brandCandidates) {
             if (c.bbox && c.bbox.length >= 4) {
                 const xs = c.bbox.map(p => p[0]);
                 const ys = c.bbox.map(p => p[1]);
-                const area = (Math.max(...xs) - Math.min(...xs)) * (Math.max(...ys) - Math.min(...ys));
+                const cHeight = Math.max(...ys) - Math.min(...ys);
+                // Packaging brand display headings must have font prominence above normal body text
+                if (cHeight < medianH * 1.25 && cHeight < 24) continue;
+                const area = (Math.max(...xs) - Math.min(...xs)) * cHeight;
                 if (area > bestArea) {
                     bestArea = area;
                     brandNameVal = c.text.trim();
                     brandNameElem = c;
                 }
             }
-        }
-        if (!brandNameVal) {
-            brandNameVal = brandCandidates[0].text.trim();
-            brandNameElem = brandCandidates[0];
         }
     }
 
@@ -1355,19 +1538,18 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // Disambiguation: If brand matches what was picked as productName,
     // re-assign productName to the next best candidate
     if (brandNameVal && prodName && brandNameVal.toLowerCase().trim() === prodName.toLowerCase().trim()) {
-        const nextProductCandidate = rawElements.find(el => {
+        const nextProductCandidates = rawElements.filter(el => {
             const tr = el.text.trim();
-            if (tr.length < 4 || tr.length > 60) return false;
+            if (tr.length < 3 || tr.length > 60) return false;
             if (tr.toLowerCase() === brandNameVal.toLowerCase()) return false;
-            if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
-            if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|usp|rs\.?|price|manufactured|marketed|packed|imported|country)/i.test(tr)) return false;
-            if (/^[\d.]+$/.test(tr)) return false;
-            if (tr.split(/\s+/).length >= 2 || tr.length >= 6) return true;
-            return false;
-        });
-        if (nextProductCandidate) {
-            prodName = nextProductCandidate.text.trim();
-            prodNameElem = nextProductCandidate;
+            if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr)) return false;
+            return true;
+        }).map(c => ({ candidate: c, ...scoreProductCandidate(c) }));
+        
+        nextProductCandidates.sort((a, b) => b.score - a.score);
+        if (nextProductCandidates.length > 0 && nextProductCandidates[0].score >= 45) {
+            prodName = nextProductCandidates[0].candidate.text.trim();
+            prodNameElem = nextProductCandidates[0].candidate;
             declarations.productName = createEvidenceRecord(prodName, prodNameElem, 'verified');
             validation.productName = {
                 status: 'verified',
@@ -1420,7 +1602,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // Validate fields with well-defined shapes. Non-conforming values
     // get status: 'REVIEW' and value: null so Gemini fallback can recover them.
     // -------------------------------------------------------------
-    const netQtyValidation = validateFieldFormat('netQuantity', netQtyElem?.text);
+    const netQtyValidation = validateFieldFormat('netQuantity', netQtyVal ? { value: netQtyVal, unit: netQtyUnit } : netQtyElem?.text);
     if (!netQtyValidation.valid) {
         console.warn(`[Extraction] Format validation rejected netQuantity: ${netQtyValidation.reason} (raw: "${netQtyElem?.text}"`);
         // Keep the parsed numeric value/unit only if the raw text was clean
@@ -1793,20 +1975,149 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     });
 
     // =========================================================================
+    // Semantic Identity Arbitration via GPT-OSS 120B (Groq API)
+    // Resolves genuine ambiguity for productName, brandName, genericCommodityName
+    // =========================================================================
+    // Semantic Identity Arbitration via GPT-OSS 120B (Groq API)
+    // Resolves genuine ambiguity for productName, brandName, genericCommodityName
+    // while keeping all statutory/numeric declarations strictly deterministic.
+    // =========================================================================
+    const identityFields = ['productName', 'brandName', 'genericCommodityName'];
+    const unresolvedIdentityFields = identityFields.filter(f => {
+        const val = merged[f];
+        const decl = merged.declarations?.[f];
+        const reconField = merged.reconciliation?.fields?.[f];
+
+        // 1. If explicitly queued for semantic reconciliation
+        if (fieldsNeedingGemini[f] && fieldsNeedingGemini[f].length > 0) return true;
+
+        // 2. If missing or unverified in reconciliation
+        if (!val || reconField?.status === 'pending_gemini' || reconField?.status === 'not_detected') return true;
+        if (!decl || decl.status !== 'verified') return true;
+        if (decl.confidence !== undefined && decl.confidence < 0.85) return true;
+        if (merged.conflicts?.some(c => c.field === f)) return true;
+
+        // 3. Multi-photo ambiguity: differing non-empty values observed across photos
+        const distinctObs = new Set(
+            extractedList.map(e => e[f]).filter(Boolean).map(v => String(v).trim().toLowerCase())
+        );
+        if (distinctObs.size > 1) return true;
+
+        // 4. Competing title candidates: If brand or product was assigned heuristically
+        // and multiple candidates exist across photos, arbitrate to avoid brand/product inversion
+        if (f === 'productName' || f === 'brandName') {
+            const hasMultipleCandidates = extractedList.some(e => (e.rawOcrText || []).length >= 2);
+            const isHeuristic = extractedList.some(e => {
+                const s = e.declarations?.[f]?.source;
+                return s === 'title_heuristic' || s === 'font_size_heuristic' || s === 'fallback_largest' || !s;
+            });
+            if (hasMultipleCandidates && isHeuristic && (!merged.genericCommodityName || distinctObs.size > 0)) {
+                return true;
+            }
+        }
+
+        return false;
+    });
+
+    if (unresolvedIdentityFields.length > 0 && gptOssService.isAvailable()) {
+        console.log(`[Reconciliation] Invoking GPT-OSS 120B for ambiguous identity fields:`, unresolvedIdentityFields);
+
+        // Aggregate deterministic candidates across photos
+        const deterministicCandidates = [];
+        extractedList.forEach((e, idx) => {
+            identityFields.forEach(f => {
+                const val = e[f];
+                const decl = e.declarations?.[f];
+                if (val) {
+                    deterministicCandidates.push({
+                        field: f,
+                        photoId: `Photo #${idx + 1}`,
+                        text: String(val),
+                        confidence: decl?.confidence || 0.8,
+                        score: decl?.score || 0
+                    });
+                }
+            });
+        });
+
+        // Collect all OCR text tokens across photos
+        const allOcrTokens = [];
+        extractedList.forEach(e => {
+            if (Array.isArray(e.rawOcrText)) {
+                e.rawOcrText.forEach(t => allOcrTokens.push(t));
+            }
+        });
+
+        try {
+            const gptOssResult = await gptOssService.resolveIdentityFields({
+                unresolvedFields: unresolvedIdentityFields,
+                deterministicCandidates,
+                rawOcrTokens: allOcrTokens,
+                imageMeta: { width: 1000, height: 1000 }
+            });
+
+            if (gptOssResult.success && gptOssResult.decisions) {
+                merged.reconciliation.gptOssUsed = true;
+                merged.reconciliation.gptOssModel = gptOssResult.model;
+
+                for (const field of unresolvedIdentityFields) {
+                    const decision = gptOssResult.decisions[field];
+                    if (decision && decision.value) {
+                        const validation = validateFieldFormat(field, decision.value);
+                        if (validation.valid) {
+                            console.log(`[Reconciliation] GPT-OSS 120B resolved ${field}: "${merged[field]}" -> "${decision.value}" (${decision.reason})`);
+                            merged[field] = decision.value;
+                            if (!merged.declarations[field]) merged.declarations[field] = { value: null };
+                            merged.declarations[field].value = decision.value;
+                            merged.declarations[field].source = 'gpt_oss_120b';
+                            merged.declarations[field].aiAssisted = true;
+                            merged.declarations[field].status = 'ai_assisted';
+                            merged.declarations[field].confidence = decision.confidence;
+                            merged.declarations[field].reasoning = decision.reason;
+
+                            if (merged.reconciliation?.fields?.[field]) {
+                                merged.reconciliation.fields[field].status = 'gpt_oss_resolved';
+                                merged.reconciliation.fields[field].resolvedValue = decision.value;
+                                merged.reconciliation.fields[field].gptOssReasoning = decision.reason;
+                            }
+
+                            // Remove from fields needing Gemini if already resolved
+                            delete fieldsNeedingGemini[field];
+                        } else {
+                            console.warn(`[Reconciliation] Format check rejected GPT-OSS 120B ${field}: "${decision.value}" (${validation.reason})`);
+                        }
+                    }
+                }
+            } else if (!gptOssResult.skipped) {
+                console.warn('[Reconciliation] GPT-OSS 120B was unable to resolve fields:', gptOssResult.reason || gptOssResult.error);
+            }
+        } catch (gptErr) {
+            console.warn('[Reconciliation] GPT-OSS 120B invocation caught exception:', gptErr.message);
+        }
+
+        // Once GPT-OSS has processed the scan, ensure identity fields are not routed to Gemini
+        identityFields.forEach(f => {
+            delete fieldsNeedingGemini[f];
+        });
+    }
+
+    // =========================================================================
     // Phase 5 Fix 1 — Phase 2: Mandatory Gemini Verification for Identity Fields
     // (Master Prompt Section 1: productName, brandName, and genericCommodityName
-    // must pass through Gemini verification on EVERY scan, single or multi-photo).
+    // fallback to Gemini only if GPT-OSS 120B is unavailable).
     // =========================================================================
-    const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
-    highStakesVerificationFields.forEach(f => {
-        if (!fieldsNeedingGemini[f]) {
-            const obs = extractedList.map((e, idx) => {
-                const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
-                return val ? { value: String(val), photoId: `Photo #${idx + 1}`, rawText: String(val) } : null;
-            }).filter(Boolean);
-            fieldsNeedingGemini[f] = obs.length > 0 ? obs : [{ value: '', photoId: 'Photo #1', rawText: '' }];
-        }
-    });
+    if (!merged.reconciliation.gptOssUsed && !gptOssService.isAvailable()) {
+        const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
+        highStakesVerificationFields.forEach(f => {
+            if (!fieldsNeedingGemini[f]) {
+                const obs = extractedList.map((e, idx) => {
+                    const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
+                    return val ? { value: String(val), photoId: `Photo #${idx + 1}`, rawText: String(val) } : null;
+                }).filter(Boolean);
+                fieldsNeedingGemini[f] = obs.length > 0 ? obs : [{ value: '', photoId: 'Photo #1', rawText: '' }];
+            }
+        });
+    }
 
     if (Object.keys(fieldsNeedingGemini).length > 0 && geminiService.isAvailable()) {
         console.log(`[Reconciliation] Running Gemini verification on ${Object.keys(fieldsNeedingGemini).length} field(s):`, Object.keys(fieldsNeedingGemini));
@@ -1885,13 +2196,16 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             }
 
             // Section 1 & 3: Apply brand classification with confidence-based overwrite policy
-            if (geminiResult.brandClassification) {
+            // Only applied if GPT-OSS 120B is not available and was not used
+            if (geminiResult.brandClassification && !merged.reconciliation.gptOssUsed && !gptOssService.isAvailable()) {
                 const bc = geminiResult.brandClassification;
                 
                 const canOverwriteIdentity = (fieldKey, currentVal) => {
+                    if (merged.reconciliation?.gptOssUsed) return false;
+                    const decl = merged.declarations?.[fieldKey];
+                    if (decl?.source === 'gpt_oss_120b') return false;
                     if (!currentVal) return true;
                     if (isDateShaped(currentVal)) return true;
-                    const decl = merged.declarations?.[fieldKey];
                     if (!decl || decl.status !== 'verified') return true;
                     if (decl.confidence !== undefined && decl.confidence < 0.85) return true;
                     if (merged.conflicts?.some(c => c.field === fieldKey)) return true;
@@ -2051,6 +2365,11 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
     ];
     
     fieldsToCheck.forEach(({ name, val }) => {
+        // If GPT-OSS 120B is available or was used, identity fields are managed by GPT-OSS, not Gemini image fallback
+        if ((name === 'productName' || name === 'brandName' || name === 'genericCommodityName') && 
+            (gptOssService.isAvailable() || mergedFields.reconciliation?.gptOssUsed)) {
+            return;
+        }
         const declKey = name.split('.')[0];
         const decl = mergedFields.declarations?.[declKey];
         const isUnverified = !decl || decl.status !== 'verified';
@@ -2090,6 +2409,12 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
         const formatCheck = validateFieldFormat(fieldPath, value);
         if (!formatCheck.valid) {
             console.warn(`[Gemini Fallback] Rejected invalid format for "${fieldPath}": "${value}" (${formatCheck.reason})`);
+            return;
+        }
+
+        // Strict protection: Never overwrite GPT-OSS 120B arbitrated fields with Gemini fallback
+        if (decl?.source === 'gpt_oss_120b' || 
+            ((fieldPath === 'productName' || fieldPath === 'brandName' || fieldPath === 'genericCommodityName') && gptOssService.isAvailable())) {
             return;
         }
 
