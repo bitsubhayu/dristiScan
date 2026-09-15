@@ -62,7 +62,7 @@ def get_ocr():
 # =============================================================================
 # Phase 5 Fix 4: CLAHE Contrast Enhancement
 # Specifically helps dark-background, light-text style labels seen on glossy
-# bottles (e.g., Optimum Nutrition). Applied before OCR inference.
+# packaging (e.g., dark-background, glossy-label products). Applied before OCR inference.
 # =============================================================================
 def apply_clahe(img):
     """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to improve
@@ -76,13 +76,13 @@ def apply_clahe(img):
     return enhanced
 
 # =============================================================================
-# Phase 5 Fix 4 + Speed Upgrade: Controlled Image Resizing & Tiling Fallback
-# Pre-resizes high-resolution packaging photos to MAX_IMAGE_DIM (1920px) before
-# PaddleOCR so normal phone photos run in a single pass without multi-tile explosion.
-# Tiling remains available as a fallback for ultra-large images.
+# Phase 5 Fix 4 + Speed Upgrade: Three-tier Image Routing & Tiling Fallback
+# 1. Ultra-large images (> 2560px) run tiled OCR at full resolution to preserve fine statutory print.
+# 2. Large phone photos (1920-2560px) are scaled to MAX_IMAGE_DIM (1920px) for fast single-pass.
+# 3. Standard images (<= 1920px) run single-pass at native resolution.
 # =============================================================================
-MAX_IMAGE_DIM = 1920   # Controlled maximum dimension before OCR (preserves aspect ratio)
-TILE_THRESHOLD = 2560  # Only tile images larger than this on any side (fallback)
+MAX_IMAGE_DIM = 1920   # Controlled maximum dimension for single-pass fast path (preserves aspect ratio)
+TILE_THRESHOLD = 2560  # Ultra-large images above this on any side trigger full-resolution tiled OCR
 TILE_SIZE = 1920       # Each tile is at most this size
 TILE_OVERLAP = 0.15    # 15% overlap between adjacent tiles
 
@@ -224,7 +224,8 @@ async def startup_event():
     print("  - CLAHE contrast enhancement: ON")
     print("  - Detection side length limit: 2560")
     print("  - Recognition score threshold: 0.3 (lowered)")
-    print(f"  - Tiling threshold: {TILE_THRESHOLD}px")
+    print(f"  - Tiling threshold: {TILE_THRESHOLD}px (ultra-large images > {TILE_THRESHOLD}px use full-res tiling)")
+    print(f"  - Controlled downscale: {MAX_IMAGE_DIM}px (images between {MAX_IMAGE_DIM}px and {TILE_THRESHOLD}px)")
     print("  - Model loaded in background worker: YES")
     print("="*50 + "\n")
     # Initiate model warm-up in background thread so HTTP server binds port immediately
@@ -250,7 +251,9 @@ def health_check():
         "cpuThreads": 6,
         "phase5Enhancements": {
             "clahe": True,
+            "routing": "three-tier (tiled >2560px, resized 1920-2560px, native <=1920px)",
             "tilingThreshold": TILE_THRESHOLD,
+            "maxImageDim": MAX_IMAGE_DIM,
             "detLimitSideLen": 2560,
             "recScoreThresh": 0.3,
             "modelLoadedOnce": True
@@ -289,42 +292,40 @@ async def perform_ocr(image: UploadFile = File(...)):
     orig_h, orig_w = img.shape[:2]
 
     # -------------------------------------------------------------------------
-    # Speed Upgrade: Pre-resize high-resolution photos to MAX_IMAGE_DIM (1920px)
-    # Preserves aspect ratio with cv2.INTER_AREA. Does not upscale smaller images.
+    # Issue 8: Execution routing based on ORIGINAL photo dimensions.
+    # 1. Ultra-large image (> TILE_THRESHOLD 2560px): preserve full resolution
+    #    via tiling so fine statutory print isn't lost to downscaling.
+    # 2. Normal large phone photo (> MAX_IMAGE_DIM 1920px): fast single-pass path
+    #    via controlled downscale to 1920px.
+    # 3. Standard photo (<= MAX_IMAGE_DIM 1920px): single-pass at original scale.
     # -------------------------------------------------------------------------
-    if max(orig_h, orig_w) > MAX_IMAGE_DIM:
+    if max(orig_h, orig_w) > TILE_THRESHOLD:
+        scale = 1.0
+        enhanced_img = apply_clahe(img)
+        use_tiling = True
+    elif max(orig_h, orig_w) > MAX_IMAGE_DIM:
         scale = MAX_IMAGE_DIM / float(max(orig_h, orig_w))
         new_w = int(orig_w * scale)
         new_h = int(orig_h * scale)
         resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        enhanced_img = apply_clahe(resized_img)
+        use_tiling = False
     else:
         scale = 1.0
-        resized_img = img
-
-    # -------------------------------------------------------------------------
-    # Phase 5 Fix 4: CLAHE contrast enhancement
-    # Improves readability of dark-background labels, glossy/glare-heavy surfaces
-    # -------------------------------------------------------------------------
-    enhanced_img = apply_clahe(resized_img)
+        enhanced_img = apply_clahe(img)
+        use_tiling = False
 
     start_time = time.time()
 
-    # -------------------------------------------------------------------------
-    # Tiling fallback: only triggered if the working image genuinely exceeds TILE_THRESHOLD
-    # -------------------------------------------------------------------------
-    cur_h, cur_w = enhanced_img.shape[:2]
-    use_tiling = max(cur_h, cur_w) > TILE_THRESHOLD
-
     if use_tiling:
-        print(f"[OCR] Large image detected ({cur_w}x{cur_h}), using tiled OCR...")
+        print(f"[OCR] Ultra-large image detected ({orig_w}x{orig_h} > {TILE_THRESHOLD}px), using tiled OCR at full resolution...")
         tiled_results = run_tiled_ocr(enhanced_img)
         formatted_results = []
         for r in tiled_results:
-            bbox = [[int(pt[0] / scale), int(pt[1] / scale)] for pt in r.get("bbox", [])] if scale != 1.0 else r.get("bbox", [])
             formatted_results.append({
                 "text": r["text"],
                 "confidence": r["confidence"],
-                "bbox": bbox
+                "bbox": r.get("bbox", [])
             })
     else:
         # Standard path: single PaddleOCR pass
