@@ -107,6 +107,8 @@ const buildCompactOcrContext = (ocrTokens = [], maxTokens = 30) => {
             text: t.text.trim(),
             confidence: typeof t.confidence === 'number' ? Math.round(t.confidence * 100) / 100 : 0.8,
             normalizedBbox: Array.isArray(t.bbox) && t.bbox.length >= 4 ? t.bbox : []
+            // ^ These are 0–1 fractions of that token's own source photo dimensions,
+            //   pre-normalized in extractFields using imageWidth/imageHeight from OCR.
         }));
 };
 
@@ -259,6 +261,13 @@ const resolveIdentityFields = async ({
             // Verify negative constraints: must not look like date, price, unit, or badge
             if (/\b\d{1,2}[/-]\d{2,4}\b/.test(valStr) || /[₹$€£]/.test(valStr) || /^\d+\s*(?:mg|g|ml|kg)\b/i.test(valStr)) {
                 console.warn(`[GptOssService] Negative constraint rejected invalid ${field}: "${valStr}"`);
+                validatedDecisions[field] = null;
+                continue;
+            }
+
+            // Packaging-handling directives must never be selected as identity fields
+            if (/\b(?:cut|tear|open|peel|pull|press|push|twist|fold|snip)\b.{0,20}\b(?:here|along|dotted\s*line|to\s*open|tab)\b/i.test(valStr)) {
+                console.warn(`[GptOssService] Negative constraint rejected packaging directive ${field}: "${valStr}"`);
                 validatedDecisions[field] = null;
                 continue;
             }

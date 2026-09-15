@@ -148,6 +148,109 @@ const isMarketingBadge = (text) => {
 };
 
 /**
+ * Filter out non-product-title candidates across 13 rejection categories.
+ * Moved to module scope for uniform validation across deterministic extraction,
+ * GPT-OSS 120B output validation, and Gemini reconciliation validation.
+ */
+const isNonProductTitleCandidate = (rawText) => {
+    if (!rawText || typeof rawText !== 'string') return true;
+    const tr = rawText.trim();
+    if (tr.length < 2 || tr.length > 70) return true;
+
+    // 1. Single character or isolated symbols
+    if (/^[^\w\s]+$/.test(tr) || tr.length === 1) return true;
+
+    // 2. Pure digits, decimals, times, pure punctuation, or phone numbers
+    if (/^\d+(?:\.\d+)?$/.test(tr)) return true;
+    if (/^\d+\.\d{2}$/.test(tr)) return true;
+    if (/\d{1,2}:\d{2}/.test(tr)) return true;
+    if (/^[+\d\s\-().]{7,25}$/.test(tr)) return true;
+
+    // 3. Quantities, dosages, servings, counts, and standalone units:
+    if (/^\s*\d+(?:\.\d+)?\s*(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|cl|oz|fl\s*oz|pt|kcal|tablets?|capsules?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|servings?|count|ct)\b/i.test(tr)) return true;
+    if (/^\s*(?:approx\.?\s*)?\d+(?:\.\d+)?\s*(?:mg|g|ml|kg|l)\b/i.test(tr)) return true;
+    if (/^\s*(?:\d+\s*)?(?:capsules?|tablets?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|scoop)[:.-]?$/i.test(tr)) return true;
+    if (/^\s*(?:\d+\s*)?(?:servings?|servings?\s*per\s*container)[:.-]?/i.test(tr)) return true;
+    if (/servings?$/i.test(tr)) return true;
+    if (/^\d+\s*Capsule\s*\(/i.test(tr)) return true;
+
+    const withoutNum = tr.replace(/[\d.,+\-/()%\s]/g, '').toLowerCase();
+    if (withoutNum.length > 0 && /^(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|oz|pt|kcal|mcg|tablets?|capsules?|softgels?|servings?)$/i.test(withoutNum)) return true;
+
+    // 4. Prices, taxes, and currency:
+    if (/[₹$€£]/.test(tr)) return true;
+    if (/\b(?:rs\.?|inr)\s*[:.-]?\s*\d+/i.test(tr)) return true;
+    if (/\b(?:mrp|usp|unit\s*sale\s*price|max\s*retail)\b/i.test(tr)) return true;
+    if (/\b\d+(?:\.\d+)?\s*\/\s*(?:cap|tab|g|kg|ml|unit|pc|piece)\b/i.test(tr)) return true;
+    if (/\b(?:taxes?|tax\b|incl\.?\s*of|inclusive\s*of)\b/i.test(tr)) return true;
+    if (/^\(?cincl\.?of/i.test(tr)) return true;
+
+    // 5. Dates, months, timestamps, and packaging codes:
+    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(tr)) return true;
+    if (/\b\d{1,2}[/]\d{2,4}\b/.test(tr)) return true;
+    if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]*\d{2,4}\b/i.test(tr)) return true;
+    if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return true;
+    if (/\b(?:mfg|pkd|exp|expiry|best\s*before|use\s*by|packed\s*on)\b/i.test(tr)) return true;
+
+    // 6. Batch / Lot / Serial numbers:
+    if (/\b(?:batch|lot|b\.?\s*no\.?)\b/i.test(tr)) return true;
+    if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return true;
+    if (/^B\d{4,}$/i.test(tr)) return true;
+
+    // 7. Regulatory, Licenses, Standards, Barcodes:
+    if (/\b(?:fssai|lic\.?\s*no\.?|license)\b/i.test(tr)) return true;
+    if (/^\d{14}$/.test(tr)) return true;
+    if (/\d{5,}"\d{5,}/.test(tr)) return true;
+    if (/\b(?:ICMR|RDA|WHO|GMP|ISO|HACCP)\b/i.test(tr)) return true;
+    if (/percent\s*rda|guideline\s*2020|medical\s*research/i.test(tr)) return true;
+
+    // 8. Additives, INS numbers, Excipients:
+    if (/INS\s*\d+/i.test(tr)) return true;
+    if (/\b(?:preservative|humectant|emulsifier|stabilizer|thickener|acidity\s*regulator|anti-caking)\b/i.test(tr)) return true;
+    if (/^-\s*(?:monounsaturated|polyunsaturated|saturated|trans\s*fat|cholesterol|epa|dha)/i.test(tr)) return true;
+
+    // 9. Nutrition panel & Ingredients headers/rows:
+    if (/^(?:nutrition\s*(?:information|facts)?|nutritional\s*information|supplement\s*facts|ingredients?|ingredents?|ngedients?)\s*[:.-]?$/i.test(tr)) return true;
+    if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?\s*(?:\d|<|>|nil|trace|none|\bper\b|\bamount\b|\bg\b|\bmg\b|\bkcal\b)/i.test(tr)) return true;
+    if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?$/i.test(tr)) return true;
+    if (/\b(?:per\s*serving|amount\s*per\s*serving|daily\s*value|\bper\s*100g?\b)\b/i.test(tr)) return true;
+    if (/^allergens?\b/i.test(tr)) return true;
+
+    // 10. Contact, Customer care, URLs, Phones, Feedback:
+    if (/^(?:customer|consumer|client)\b/i.test(tr)) return true;
+    if (/\b(?:customer\s*care|consumer\s*care|for\s*feedback|helpline|toll\s*free|call\s*1-|call\s*\+91)\b/i.test(tr)) return true;
+    if (/\b(?:https?:\/\/|www\.|\.(?:com|org|net|in|co|gov|edu)\b)/i.test(tr)) return true;
+    if (/^(?:visit|check|browse|follow|refer\s*to)\s+(?:us|our|online|website|at|for|more)?\b/i.test(tr)) return true;
+
+    // 11. Storage instructions & Disclaimers:
+    if (/\b(?:store\s*in|keep\s*in|cool\s*and\s*dry|direct\s*sunlight|keep\s*out\s*of\s*reach|how\s*to\s*use|directions?\s*for\s*use)\b/i.test(tr)) return true;
+    if (/\b(?:not\s*for\s*medicinal|not\s*to\s*exceed|consult\s*your)\b/i.test(tr)) return true;
+
+    // 12. Corporate suffixes, Legal clauses, Manufacturing notes, and Sentence fragments:
+    if (/[,;.]$/.test(tr)) return true; // Sentence fragments ending with punctuation
+    if (/^(?:for|to|and|with|our|from|in|on|at|by|of)\s+/i.test(tr)) return true; // Prepositional phrases
+    if (/\b(?:feedback|customer|consumer|our\s*products?)\b/i.test(tr)) return true;
+    if (/^(?:the|and|or|for|with|from|this|that|these|those|our|your|their|are|was|were|been|have|has|had|not|can|may|will|would|should|could|online)$/i.test(tr)) return true; // Isolated stop words
+    if (/^(?:ation|tion|sion|ment|ties|ness|able|ible|ised|ized|tured|ing|ed)$/i.test(tr)) return true; // Isolated morphemes / clipped suffixes
+    if (/\b(?:manufactured\s*by|marketed\s*by|packed\s*by|imported\s*by|mfd\.?\s*by|pkd\.?\s*by|made\s*in\b)/i.test(tr)) return true;
+    if (/\b(?:is|are|was|were|been|being)\s+(?:manufactured|packed|marketed|distributed|produced|formulated|made|bottled|processed)\b/i.test(tr)) return true; // Passive manufacturing clauses
+    if (/\b(?:recycle|recyclable|no\s*refill|please\s*recycle|crush\s*the\s*bottle|dispose\s*of)\b/i.test(tr)) return true; // Generic packaging handling directives
+    if (/\b(?:proof\s*of\s*purch(?:ase)?|code\s*under\s*(?:the\s*)?cap|scratch\s*code|scan\s*qr|scan\s*to\s*win)\b/i.test(tr)) return true; // Generic consumer packaging promotions
+    if (/^(?:share|enjoy|taste|try|feel|drink|serve|refresh)\s+(?:a|an|the|our|this)\b/i.test(tr)) return true; // Generic imperative marketing slogans
+    if (/^[a-z0-9\s]+:$/i.test(tr)) return true;
+
+    // 13. Imperative / procedural packaging-handling directives — generic,
+    // not tied to any specific product (e.g. cut-here marks, tear lines,
+    // twist-open caps, peel tabs). These are printed instructions for
+    // handling the package, never the product's identity.
+    if (/\b(?:cut|tear|open|peel|pull|press|push|twist|fold|snip|lift)\b.{0,20}\b(?:here|along|this\s*(?:line|side|edge)|dotted\s*line|perforat\w*|to\s*open|tab|corner)\b/i.test(tr)) return true;
+    if (/^(?:cut|tear|open|peel|pull|press|push|twist|fold|snip)\s+(?:here|from\s*here|along|this|the|open|carefully)/i.test(tr)) return true;
+    if (/\b(?:dotted|perforated)\s*line\b/i.test(tr)) return true;
+
+    return false;
+};
+
+/**
  * Post-extraction format validator for fields with well-defined shapes.
  * Returns { valid: true, value } if the value conforms, or { valid: false, reason } if not.
  * Non-conforming values should be marked REVIEW, not accepted as-is.
@@ -165,6 +268,9 @@ const validateFieldFormat = (fieldName, value) => {
             }
             if (isMarketingBadge(str)) {
                 return { valid: false, reason: `Field value "${str}" is a promotional/marketing badge — rejected` };
+            }
+            if (isNonProductTitleCandidate(str)) {
+                return { valid: false, reason: `Rejected by identity-candidate filter: "${str}"` };
             }
             if (str.length < 2) {
                 return { valid: false, reason: 'Too short to be a valid identity declaration' };
@@ -320,6 +426,10 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     if (!Array.isArray(resultsArray)) {
         resultsArray = [];
     }
+
+    // Capture source image dimensions for bbox normalization (Issue 4)
+    const sourceImageWidth = ocrResults?.imageWidth || 0;
+    const sourceImageHeight = ocrResults?.imageHeight || 0;
 
     const rawElements = resultsArray.map((r, idx) => ({
         index: idx,
@@ -1263,95 +1373,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     const COMMODITY_NOUNS = /\b(?:oil|whey|protein|creatine|capsules?|tablets?|softgels?|syrup|sauce|ketchup|juice|drink|tea|coffee|biscuit|cookies?|snack|chips|noodles|pasta|flour|atta|rice|dal|salt|sugar|water|cola|soda|paste|spread|jam|butter|ghee|paneer|cheese|milk|curd|yogurt|cereal|oats|muesli|honey|vinegar|shampoo|soap|wash|lotion|cream|powder)\b/i;
 
-    const isNonProductTitleCandidate = (rawText) => {
-        if (!rawText || typeof rawText !== 'string') return true;
-        const tr = rawText.trim();
-        if (tr.length < 2 || tr.length > 70) return true;
+    // Note: isNonProductTitleCandidate is defined at module scope for shared use
 
-        // 1. Single character or isolated symbols
-        if (/^[^\w\s]+$/.test(tr) || tr.length === 1) return true;
-
-        // 2. Pure digits, decimals, times, pure punctuation, or phone numbers
-        if (/^\d+(?:\.\d+)?$/.test(tr)) return true;
-        if (/^\d+\.\d{2}$/.test(tr)) return true;
-        if (/\d{1,2}:\d{2}/.test(tr)) return true;
-        if (/^[+\d\s\-().]{7,25}$/.test(tr)) return true;
-
-        // 3. Quantities, dosages, servings, counts, and standalone units:
-        if (/^\s*\d+(?:\.\d+)?\s*(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|cl|oz|fl\s*oz|pt|kcal|tablets?|capsules?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|servings?|count|ct)\b/i.test(tr)) return true;
-        if (/^\s*(?:approx\.?\s*)?\d+(?:\.\d+)?\s*(?:mg|g|ml|kg|l)\b/i.test(tr)) return true;
-        if (/^\s*(?:\d+\s*)?(?:capsules?|tablets?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|scoop)[:.-]?$/i.test(tr)) return true;
-        if (/^\s*(?:\d+\s*)?(?:servings?|servings?\s*per\s*container)[:.-]?/i.test(tr)) return true;
-        if (/servings?$/i.test(tr)) return true;
-        if (/^\d+\s*Capsule\s*\(/i.test(tr)) return true;
-
-        const withoutNum = tr.replace(/[\d.,+\-/()%\s]/g, '').toLowerCase();
-        if (withoutNum.length > 0 && /^(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|oz|pt|kcal|mcg|tablets?|capsules?|softgels?|servings?)$/i.test(withoutNum)) return true;
-
-        // 4. Prices, taxes, and currency:
-        if (/[₹$€£]/.test(tr)) return true;
-        if (/\b(?:rs\.?|inr)\s*[:.-]?\s*\d+/i.test(tr)) return true;
-        if (/\b(?:mrp|usp|unit\s*sale\s*price|max\s*retail)\b/i.test(tr)) return true;
-        if (/\b\d+(?:\.\d+)?\s*\/\s*(?:cap|tab|g|kg|ml|unit|pc|piece)\b/i.test(tr)) return true;
-        if (/\b(?:taxes?|tax\b|incl\.?\s*of|inclusive\s*of)\b/i.test(tr)) return true;
-        if (/^\(?cincl\.?of/i.test(tr)) return true;
-
-        // 5. Dates, months, timestamps, and packaging codes:
-        if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(tr)) return true;
-        if (/\b\d{1,2}[/]\d{2,4}\b/.test(tr)) return true;
-        if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]*\d{2,4}\b/i.test(tr)) return true;
-        if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return true;
-        if (/\b(?:mfg|pkd|exp|expiry|best\s*before|use\s*by|packed\s*on)\b/i.test(tr)) return true;
-
-        // 6. Batch / Lot / Serial numbers:
-        if (/\b(?:batch|lot|b\.?\s*no\.?)\b/i.test(tr)) return true;
-        if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return true;
-        if (/^B\d{4,}$/i.test(tr)) return true;
-
-        // 7. Regulatory, Licenses, Standards, Barcodes:
-        if (/\b(?:fssai|lic\.?\s*no\.?|license)\b/i.test(tr)) return true;
-        if (/^\d{14}$/.test(tr)) return true;
-        if (/\d{5,}"\d{5,}/.test(tr)) return true;
-        if (/\b(?:ICMR|RDA|WHO|GMP|ISO|HACCP)\b/i.test(tr)) return true;
-        if (/percent\s*rda|guideline\s*2020|medical\s*research/i.test(tr)) return true;
-
-        // 8. Additives, INS numbers, Excipients:
-        if (/INS\s*\d+/i.test(tr)) return true;
-        if (/\b(?:preservative|humectant|emulsifier|stabilizer|thickener|acidity\s*regulator|anti-caking)\b/i.test(tr)) return true;
-        if (/^-\s*(?:monounsaturated|polyunsaturated|saturated|trans\s*fat|cholesterol|epa|dha)/i.test(tr)) return true;
-
-        // 9. Nutrition panel & Ingredients headers/rows:
-        if (/^(?:nutrition\s*(?:information|facts)?|nutritional\s*information|supplement\s*facts|ingredients?|ingredents?|ngedients?)\s*[:.-]?$/i.test(tr)) return true;
-        if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?\s*(?:\d|<|>|nil|trace|none|\bper\b|\bamount\b|\bg\b|\bmg\b|\bkcal\b)/i.test(tr)) return true;
-        if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?$/i.test(tr)) return true;
-        if (/\b(?:per\s*serving|amount\s*per\s*serving|daily\s*value|\bper\s*100g?\b)\b/i.test(tr)) return true;
-        if (/^allergens?\b/i.test(tr)) return true;
-
-        // 10. Contact, Customer care, URLs, Phones, Feedback:
-        if (/^(?:customer|consumer|client)\b/i.test(tr)) return true;
-        if (/\b(?:customer\s*care|consumer\s*care|for\s*feedback|helpline|toll\s*free|call\s*1-|call\s*\+91)\b/i.test(tr)) return true;
-        if (/\b(?:https?:\/\/|www\.|\.(?:com|org|net|in|co|gov|edu)\b)/i.test(tr)) return true;
-        if (/^(?:visit|check|browse|follow|refer\s*to)\s+(?:us|our|online|website|at|for|more)?\b/i.test(tr)) return true;
-
-        // 11. Storage instructions & Disclaimers:
-        if (/\b(?:store\s*in|keep\s*in|cool\s*and\s*dry|direct\s*sunlight|keep\s*out\s*of\s*reach|how\s*to\s*use|directions?\s*for\s*use)\b/i.test(tr)) return true;
-        if (/\b(?:not\s*for\s*medicinal|not\s*to\s*exceed|consult\s*your)\b/i.test(tr)) return true;
-
-        // 12. Corporate suffixes, Legal clauses, Manufacturing notes, and Sentence fragments:
-        if (/[,;.]$/.test(tr)) return true; // Sentence fragments ending with punctuation
-        if (/^(?:for|to|and|with|our|from|in|on|at|by|of)\s+/i.test(tr)) return true; // Prepositional phrases
-        if (/\b(?:feedback|customer|consumer|our\s*products?)\b/i.test(tr)) return true;
-        if (/^(?:the|and|or|for|with|from|this|that|these|those|our|your|their|are|was|were|been|have|has|had|not|can|may|will|would|should|could|online)$/i.test(tr)) return true; // Isolated stop words
-        if (/^(?:ation|tion|sion|ment|ties|ness|able|ible|ised|ized|tured|ing|ed)$/i.test(tr)) return true; // Isolated morphemes / clipped suffixes
-        if (/\b(?:manufactured\s*by|marketed\s*by|packed\s*by|imported\s*by|mfd\.?\s*by|pkd\.?\s*by|made\s*in\b)/i.test(tr)) return true;
-        if (/\b(?:is|are|was|were|been|being)\s+(?:manufactured|packed|marketed|distributed|produced|formulated|made|bottled|processed)\b/i.test(tr)) return true; // Passive manufacturing clauses
-        if (/\b(?:recycle|recyclable|no\s*refill|please\s*recycle|crush\s*the\s*bottle|dispose\s*of)\b/i.test(tr)) return true; // Generic packaging handling directives
-        if (/\b(?:proof\s*of\s*purch(?:ase)?|code\s*under\s*(?:the\s*)?cap|scratch\s*code|scan\s*qr|scan\s*to\s*win)\b/i.test(tr)) return true; // Generic consumer packaging promotions
-        if (/^(?:share|enjoy|taste|try|feel|drink|serve|refresh)\s+(?:a|an|the|our|this)\b/i.test(tr)) return true; // Generic imperative marketing slogans
-        if (/^[a-z0-9\s]+:$/i.test(tr)) return true;
-
-        return false;
-    };
 
     const scoreProductCandidate = (elem) => {
         const text = elem.text.trim();
@@ -1447,8 +1470,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         const tr = el.text.trim();
         // Must be 4-40 chars, not a known non-brand pattern
         if (tr.length < 4 || tr.length > 40) return false;
-        // Must not be a marketing badge or date-shaped
-        if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
+        // Must not be a marketing badge, date-shaped, or instructional/non-identity candidate
+        if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr)) return false;
         // Exclude month abbreviations
         if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return false;
         // Exclude generic corporate entities
@@ -1524,7 +1547,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal))) {
+    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal) || isNonProductTitleCandidate(brandNameVal))) {
         brandNameVal = null;
         brandNameElem = null;
     }
@@ -1537,6 +1560,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     // Disambiguation: If brand matches what was picked as productName,
     // re-assign productName to the next best candidate
+    let identityCollisionResolved = false;
     if (brandNameVal && prodName && brandNameVal.toLowerCase().trim() === prodName.toLowerCase().trim()) {
         const nextProductCandidates = rawElements.filter(el => {
             const tr = el.text.trim();
@@ -1555,6 +1579,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
                 status: 'verified',
                 reason: `Product name re-identified after brand separation: ${prodName}`
             };
+            identityCollisionResolved = true;
             console.log(`[Extraction] Brand/product disambiguation: brand="${brandNameVal}", product="${prodName}"`);
         }
     }
@@ -1663,7 +1688,25 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         dimensions: null,
         ingredients: sanitizeExtractedText(ingredientsText),
         nutritionFacts: nutritionFacts,
-        rawOcrText: resultsArray
+        rawOcrText: resultsArray.map(r => {
+            const entry = {
+                text: (r.text || '').trim(),
+                confidence: typeof r.confidence === 'number' ? r.confidence : 0.8,
+                bbox: r.bbox || r.boundingBox || []
+            };
+            // Normalize bbox to 0–1 fractions using this photo's own dimensions
+            // so multi-photo scans have resolution-independent coordinates (Issue 4)
+            if (sourceImageWidth > 0 && sourceImageHeight > 0 && Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
+                entry.bbox = entry.bbox.map(pt => [
+                    pt[0] / sourceImageWidth,
+                    pt[1] / sourceImageHeight
+                ]);
+            } else if (Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
+                // No image dimensions available — degrade safely to empty bbox
+                entry.bbox = [];
+            }
+            return entry;
+        }).filter(r => Boolean(r.text))
     };
 
     // Phase 5: Collect fields that are low-confidence or undetected for Gemini fallback
@@ -1691,8 +1734,25 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         normalizedFields,
         validation,
         sourceImageId,
+        identityCollisionResolved,
         lowConfidenceFields // Phase 5: for Gemini fallback
     };
+};
+
+/**
+ * Safely sets a deeply nested property on an object using dot-path notation.
+ * e.g. setNestedField(merged, 'manufacturer.name', 'Acme Corp')
+ */
+const setNestedField = (obj, path, value) => {
+    const parts = path.split('.');
+    let target = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+        if (target[parts[i]] === undefined || target[parts[i]] === null || typeof target[parts[i]] !== 'object') {
+            target[parts[i]] = {};
+        }
+        target = target[parts[i]];
+    }
+    target[parts[parts.length - 1]] = value;
 };
 
 /**
@@ -1977,9 +2037,6 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     // =========================================================================
     // Semantic Identity Arbitration via GPT-OSS 120B (Groq API)
     // Resolves genuine ambiguity for productName, brandName, genericCommodityName
-    // =========================================================================
-    // Semantic Identity Arbitration via GPT-OSS 120B (Groq API)
-    // Resolves genuine ambiguity for productName, brandName, genericCommodityName
     // while keeping all statutory/numeric declarations strictly deterministic.
     // =========================================================================
     const identityFields = ['productName', 'brandName', 'genericCommodityName'];
@@ -2006,10 +2063,19 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
         // 4. Competing title candidates: If brand or product was assigned heuristically
         // and multiple candidates exist across photos, arbitrate to avoid brand/product inversion
         if (f === 'productName' || f === 'brandName') {
+            // 4a. A same-photo brand/product naming collision was detected and
+            // resolved heuristically for at least one photo — always re-verify
+            // both identity fields regardless of the other heuristics above.
+            if (extractedList.some(e => e.identityCollisionResolved)) {
+                return true;
+            }
             const hasMultipleCandidates = extractedList.some(e => (e.rawOcrText || []).length >= 2);
             const isHeuristic = extractedList.some(e => {
                 const s = e.declarations?.[f]?.source;
-                return s === 'title_heuristic' || s === 'font_size_heuristic' || s === 'fallback_largest' || !s;
+                // Every productName/brandName value created by the deterministic
+                // scoring path defaults to source 'paddleocr_primary'. Only a value
+                // already confirmed by an LLM pass should be treated as non-heuristic.
+                return !s || s === 'paddleocr_primary';
             });
             if (hasMultipleCandidates && isHeuristic && (!merged.genericCommodityName || distinctObs.size > 0)) {
                 return true;
@@ -2053,7 +2119,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                 unresolvedFields: unresolvedIdentityFields,
                 deterministicCandidates,
                 rawOcrTokens: allOcrTokens,
-                imageMeta: { width: 1000, height: 1000 }
+                imageMeta: { width: 1, height: 1 }   // tokens are pre-normalized 0-1
             });
 
             if (gptOssResult.success && gptOssResult.decisions) {
@@ -2083,6 +2149,9 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
 
                             // Remove from fields needing Gemini if already resolved
                             delete fieldsNeedingGemini[field];
+                            // Track exactly which fields GPT-OSS actually resolved
+                            merged.reconciliation.gptOssResolvedFields = merged.reconciliation.gptOssResolvedFields || [];
+                            merged.reconciliation.gptOssResolvedFields.push(field);
                         } else {
                             console.warn(`[Reconciliation] Format check rejected GPT-OSS 120B ${field}: "${decision.value}" (${validation.reason})`);
                         }
@@ -2095,20 +2164,28 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             console.warn('[Reconciliation] GPT-OSS 120B invocation caught exception:', gptErr.message);
         }
 
-        // Once GPT-OSS has processed the scan, ensure identity fields are not routed to Gemini
+        // Only remove identity fields from Gemini queue if GPT-OSS actually resolved them
+        // (not blanket removal — fields GPT-OSS failed on or never tried should still go to Gemini)
+        const resolvedByGptOss = merged.reconciliation.gptOssResolvedFields || [];
         identityFields.forEach(f => {
-            delete fieldsNeedingGemini[f];
+            if (resolvedByGptOss.includes(f)) {
+                delete fieldsNeedingGemini[f];
+            }
         });
     }
 
     // =========================================================================
     // Phase 5 Fix 1 — Phase 2: Mandatory Gemini Verification for Identity Fields
-    // (Master Prompt Section 1: productName, brandName, and genericCommodityName
-    // fallback to Gemini only if GPT-OSS 120B is unavailable).
+    // Per-field check: only skip fields that GPT-OSS actually resolved successfully.
+    // Fields GPT-OSS never tried (gate didn't fire), or failed on (API error,
+    // rate limit, format rejection) still go to Gemini for verification.
     // =========================================================================
-    if (!merged.reconciliation.gptOssUsed && !gptOssService.isAvailable()) {
+    {
+        const gptOssResolved = merged.reconciliation.gptOssResolvedFields || [];
         const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
         highStakesVerificationFields.forEach(f => {
+            // Skip only if GPT-OSS actually resolved this specific field
+            if (gptOssResolved.includes(f)) return;
             if (!fieldsNeedingGemini[f]) {
                 const obs = extractedList.map((e, idx) => {
                     const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
@@ -2164,17 +2241,25 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                             reconField.reconciledFrom = fieldsNeedingGemini[fieldName];
                         }
                         
-                        // Apply the reconciled value
-                        const setterMap = {
-                            'productName': (m, v) => m.productName = v,
-                            'brandName': (m, v) => m.brandName = v,
-                            'genericCommodityName': (m, v) => m.genericCommodityName = v,
-                            'manufacturer.name': (m, v) => m.manufacturer.name = v,
-                            'marketer.name': (m, v) => m.marketer.name = v,
-                            'countryOfOrigin': (m, v) => m.countryOfOrigin = v,
-                        };
-                        if (setterMap[fieldName]) {
-                            setterMap[fieldName](merged, result.value);
+                        // Apply the reconciled value using generic dot-path setter (Issue 6)
+                        // Rule 4 guard: Statutory fields are strictly deterministic and never overwritten by Gemini.
+                        const STATUTORY_DETERMINISTIC_FIELDS = new Set([
+                            'mrp',
+                            'unitSalePrice',
+                            'netQuantity',
+                            'dates.manufacture',
+                            'dates.expiry',
+                            'dates.bestBefore',
+                            'batchNumber',
+                            'fssaiLicenseNumber',
+                            'servingsPerContainer',
+                            'servingSize',
+                            'ingredients',
+                            'nutritionFacts'
+                        ]);
+
+                        if (!STATUTORY_DETERMINISTIC_FIELDS.has(fieldName)) {
+                            setNestedField(merged, fieldName, result.value);
                             const declKey = fieldName.split('.')[0];
                             if (merged.declarations && merged.declarations[declKey]) {
                                 if (fieldName.includes('.')) {
@@ -2196,12 +2281,12 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             }
 
             // Section 1 & 3: Apply brand classification with confidence-based overwrite policy
-            // Only applied if GPT-OSS 120B is not available and was not used
-            if (geminiResult.brandClassification && !merged.reconciliation.gptOssUsed && !gptOssService.isAvailable()) {
+            // Per Issue 7.2: field-level check avoids redundant outer gptOss gate
+            if (geminiResult.brandClassification) {
                 const bc = geminiResult.brandClassification;
                 
                 const canOverwriteIdentity = (fieldKey, currentVal) => {
-                    if (merged.reconciliation?.gptOssUsed) return false;
+                    if ((merged.reconciliation?.gptOssResolvedFields || []).includes(fieldKey)) return false;
                     const decl = merged.declarations?.[fieldKey];
                     if (decl?.source === 'gpt_oss_120b') return false;
                     if (!currentVal) return true;
@@ -2365,9 +2450,9 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
     ];
     
     fieldsToCheck.forEach(({ name, val }) => {
-        // If GPT-OSS 120B is available or was used, identity fields are managed by GPT-OSS, not Gemini image fallback
+        // If GPT-OSS 120B actually resolved this identity field, skip Gemini image fallback for it
         if ((name === 'productName' || name === 'brandName' || name === 'genericCommodityName') && 
-            (gptOssService.isAvailable() || mergedFields.reconciliation?.gptOssUsed)) {
+            (mergedFields.reconciliation?.gptOssResolvedFields || []).includes(name)) {
             return;
         }
         const declKey = name.split('.')[0];
@@ -2414,7 +2499,8 @@ const applyGeminiFallback = async (mergedFields, images = []) => {
 
         // Strict protection: Never overwrite GPT-OSS 120B arbitrated fields with Gemini fallback
         if (decl?.source === 'gpt_oss_120b' || 
-            ((fieldPath === 'productName' || fieldPath === 'brandName' || fieldPath === 'genericCommodityName') && gptOssService.isAvailable())) {
+            ((fieldPath === 'productName' || fieldPath === 'brandName' || fieldPath === 'genericCommodityName') &&
+             (mergedFields.reconciliation?.gptOssResolvedFields || []).includes(fieldPath))) {
             return;
         }
 
@@ -2533,6 +2619,7 @@ module.exports = {
     applyGeminiFallback,
     validateFieldFormat,
     isValidQuantityUnit,
-    isDateShaped
+    isDateShaped,
+    isNonProductTitleCandidate
 };
 
