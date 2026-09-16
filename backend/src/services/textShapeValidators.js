@@ -197,6 +197,75 @@ const KNOWN_COUNTRIES = [
 ];
 
 /**
+ * Generic Commodity / Category nouns and descriptors.
+ * Prevents generic commodity concepts (e.g. protein, oil, milk, etc.)
+ * from being accepted as brandName.
+ */
+const GENERIC_COMMODITY_NOUNS = new Set([
+    'protein', 'whey', 'isolate', 'casein', 'creatine', 'collagen', 'bcaa', 'glutamine',
+    'milk', 'dairy', 'curd', 'yogurt', 'cheese', 'paneer', 'butter', 'ghee',
+    'juice', 'drink', 'beverage', 'water', 'soda', 'cola', 'tea', 'coffee',
+    'oil', 'flour', 'atta', 'maida', 'besan', 'sooji', 'rava', 'rice', 'dal', 'pulses', 'lentils',
+    'mustard', 'sunflower', 'olive', 'coconut', 'soybean', 'sesame', 'groundnut', 'peanut', 'canola', 'palm', 'vegetable',
+    'soap', 'shampoo', 'conditioner', 'lotion', 'cream', 'paste', 'toothpaste',
+    'biscuit', 'biscuits', 'cookie', 'cookies', 'snack', 'snacks', 'chips', 'wafers', 'namkeen',
+    'noodle', 'noodles', 'pasta', 'vermicelli', 'cereal', 'oats', 'muesli', 'corn', 'wheat',
+    'salt', 'sugar', 'jaggery', 'honey', 'vinegar', 'sauce', 'ketchup', 'jam', 'spread',
+    'spice', 'spices', 'masala', 'turmeric', 'chilli', 'coriander', 'cumin', 'pepper',
+    'supplement', 'supplements', 'capsules', 'tablets', 'softgels', 'syrup', 'powder',
+    'seeds', 'nuts', 'almonds', 'cashews', 'walnuts'
+]);
+
+const GENERIC_MODIFIER_WORDS = new Set([
+    '100%', 'pure', 'natural', 'organic', 'raw', 'refined', 'filtered', 'cold', 'pressed',
+    'virgin', 'extra', 'dietary', 'nutritional', 'food', 'health', 'instant', 'premium',
+    'classic', 'fresh', 'rich', 'creamy', 'crispy', 'roasted', 'salted', 'sweet', 'plain',
+    'edible', 'packaged', 'table', 'cooking', 'daily', 'multivitamin', 'herbal', 'ayurvedic',
+    'concentrate', 'hydrolyzed', 'blend', 'mix', 'supplement', 'powder', 'drink', 'beverage',
+    'liquid', 'capsules', 'tablets', 'softgels', 'oil', 'flour', 'grains', 'whole', 'unrefined',
+    'mustard', 'sunflower', 'olive', 'coconut', 'soybean', 'sesame', 'groundnut', 'peanut', 'vegetable'
+]);
+
+/**
+ * Checks if a string is merely a generic commodity or category descriptor.
+ */
+const isGenericCommodityTerm = (text) => {
+    if (!text || typeof text !== 'string') return false;
+    const clean = text.trim().toLowerCase();
+    if (clean.length < 2) return false;
+
+    // Direct match against known commodity nouns
+    if (GENERIC_COMMODITY_NOUNS.has(clean)) return true;
+
+    // Check if composed entirely of generic modifiers and commodity nouns
+    const words = clean.replace(/[^a-z0-9\s%]/g, ' ').split(/\s+/).filter(Boolean);
+    if (words.length === 0) return false;
+
+    const allGeneric = words.every(w => GENERIC_COMMODITY_NOUNS.has(w) || GENERIC_MODIFIER_WORDS.has(w) || /^\d+%?$/.test(w));
+    if (allGeneric && words.some(w => GENERIC_COMMODITY_NOUNS.has(w))) {
+        return true;
+    }
+
+    return false;
+};
+
+/**
+ * Checks if a string contains an explicit country of origin or manufacturing declaration.
+ */
+const EXPLICIT_COUNTRY_PREFIX_REGEX = /^(?:country\s*of\s*origin|country\s*of\s*manufacture|country\s*manufactured\s*in|made\s*in|manufactured\s*in|product\s*of|origin)\s*[:.-]?\s*(.+)/i;
+
+const isExplicitCountryDeclaration = (text) => {
+    if (!text || typeof text !== 'string') return false;
+    const t = text.trim();
+    if (t.length < 3) return false;
+
+    // Reject email / web addresses immediately
+    if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(t)) return false;
+
+    return EXPLICIT_COUNTRY_PREFIX_REGEX.test(t);
+};
+
+/**
  * Universal text sanitization helper to clean OCR noise, broken encodings,
  * mojibake (e.g. "â‚¹", "â€“"), and malformed characters such as "&þ" or isolated "þ".
  * If the resulting string has no real words or characters, returns null so clean
@@ -265,7 +334,22 @@ const validateFieldFormat = (fieldName, value) => {
             if (str.length < 2) {
                 return { valid: false, reason: 'Too short to be a valid identity declaration' };
             }
+            if (fieldName === 'brandName' && isGenericCommodityTerm(str)) {
+                return { valid: false, reason: `Generic category/commodity descriptor "${str}" cannot be accepted as brandName` };
+            }
             return { valid: true, value: str };
+        }
+        case 'countryOfOrigin': {
+            const str = String(value).trim();
+            if (!str) return { valid: false, reason: 'Empty country of origin' };
+            if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(str)) {
+                return { valid: false, reason: `Contains URL/email — not a valid country: "${str}"` };
+            }
+            const found = KNOWN_COUNTRIES.find(c => new RegExp(`\\b${c}\\b`, 'i').test(str));
+            if (!found) {
+                return { valid: false, reason: `"${str}" is not a recognized country of origin` };
+            }
+            return { valid: true, value: found === 'USA' ? 'United States' : found };
         }
         case 'netQuantity': {
             if (value && typeof value === 'object') {
@@ -373,6 +457,8 @@ module.exports = {
     isNonProductTitleCandidate,
     validateFieldFormat,
     KNOWN_COUNTRIES,
-    sanitizeExtractedText
+    sanitizeExtractedText,
+    isGenericCommodityTerm,
+    isExplicitCountryDeclaration
 };
 

@@ -8,7 +8,7 @@ const axios = require('axios');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
-const GROQ_TIMEOUT_MS = parseInt(process.env.GROQ_TIMEOUT_MS || '12000', 10);
+const GROQ_TIMEOUT_MS = parseInt(process.env.GROQ_TIMEOUT_MS || '25000', 10);
 
 /**
  * Check if Groq API key is configured and available in environment.

@@ -13,7 +13,9 @@ const {
     isValidQuantityUnit,
     validateFieldFormat,
     KNOWN_COUNTRIES,
-    sanitizeExtractedText
+    sanitizeExtractedText,
+    isGenericCommodityTerm,
+    isExplicitCountryDeclaration
 } = require('./textShapeValidators');
 
 const {
@@ -144,23 +146,28 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
     // 1. Country of Origin
     let countryVal = null;
     let countryElem = null;
-    const cooPrefixRegex = /(?:Country of Origin|Made in|Product of)\s*[:.-]?\s*([a-zA-Z\s]{2,30})/i;
+    const cooPrefixRegex = /(?:Country\s*of\s*Origin|Country\s*of\s*Manufacture|Country\s*Manufactured\s*In|Made\s*in|Manufactured\s*in|Product\s*of|Origin)\s*[:.-]?\s*([a-zA-Z\s]{2,30})/i;
     const cooMatch = fullText.match(cooPrefixRegex);
     if (cooMatch) {
         const candidate = cooMatch[1].trim();
-        for (const country of KNOWN_COUNTRIES) {
-            if (new RegExp(`\\b${country}\\b`, 'i').test(candidate)) {
-                if (!/\d|fssai|lic/i.test(candidate)) {
-                    countryVal = country === 'USA' ? 'United States' : country;
-                    countryElem = rawElements.find(r => cooPrefixRegex.test(r.text)) || null;
-                    break;
+        // Disqualify if candidate or match contains URL, email, or pure address
+        if (!/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(candidate)) {
+            for (const country of KNOWN_COUNTRIES) {
+                if (new RegExp(`\\b${country}\\b`, 'i').test(candidate)) {
+                    if (!/\d|fssai|lic/i.test(candidate)) {
+                        countryVal = country === 'USA' ? 'United States' : country;
+                        countryElem = rawElements.find(r => cooPrefixRegex.test(r.text)) || null;
+                        break;
+                    }
                 }
             }
         }
     }
     if (!countryVal) {
         for (const el of rawElements) {
-            if (/origin|made in|product of/i.test(el.text)) {
+            if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(el.text)) continue;
+            if (/\b(?:road|street|nagar|plot|industrial|dist|district|pin\s*code|\b\d{6}\b)\b/i.test(el.text) && !cooPrefixRegex.test(el.text)) continue;
+            if (cooPrefixRegex.test(el.text) || /\b(?:origin|made in|manufactured in|product of)\b/i.test(el.text)) {
                 for (const country of KNOWN_COUNTRIES) {
                     if (new RegExp(`\\b${country}\\b`, 'i').test(el.text) && !/\d|fssai|lic/i.test(el.text)) {
                         countryVal = country === 'USA' ? 'United States' : country;
@@ -421,7 +428,7 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
 
     const explicitQtyRegex = /(?:Net\s*(?:Qty|Quantity|Weight|Wt|Vol|Contents)?\.?\s*[:.-]?\s*)(\d+(?:\.\d+)?)(?:\s*(ml|g|kg|l|liter|litre|mg))?\b/i;
     const qtySearchItems = (structuredRows?.rows && structuredRows.rows.length > 0)
-        ? structuredRows.rows.map(r => ({ text: r.text, elem: r.elements[0] })).concat(rawElements.map(e => ({ text: e.text, elem: e })))
+        ? structuredRows.rows.map(r => ({ text: r.text, elem: r.elements?.[0] || null })).concat(rawElements.map(e => ({ text: e.text, elem: e })))
         : rawElements.map(e => ({ text: e.text, elem: e }));
 
     for (const item of qtySearchItems) {
@@ -538,9 +545,33 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
 
     // 10. Ingredients
     let ingredientsText = null;
-    const ingMatch = fullText.match(/(?:Ingredients?|Ingredents?|Ngedients?)\s*[:.-]?\s*([^\n\r]+)/i);
-    if (ingMatch && ingMatch[1].trim().length > 5) {
-        ingredientsText = ingMatch[1].trim();
+    if (structuredRows && Array.isArray(structuredRows.rows) && structuredRows.rows.length > 0) {
+        const ingRowIndex = structuredRows.rows.findIndex(r => /(?:Ingredients?|Ingredents?|Ngedients?)\s*[:.-]?/i.test(r.text || ''));
+        if (ingRowIndex !== -1) {
+            const firstRow = structuredRows.rows[ingRowIndex].text;
+            const stripped = firstRow.replace(/.*?(?:Ingredients?|Ingredents?|Ngedients?)\s*[:.-]?\s*/i, '').trim();
+            let accumulated = stripped;
+            for (let i = ingRowIndex + 1; i < structuredRows.rows.length && i < ingRowIndex + 6; i++) {
+                const nextRow = (structuredRows.rows[i].text || '').trim();
+                if (/\b(?:Manufactured|Marketed|Packed|Imported|Net\s*(?:Qty|Quantity|Wt|Weight)|MRP|Batch|Exp|Best\s*Before|Mfg|Mfd|Nutrition|Storage|Directions|Usage|Caution)\b/i.test(nextRow)) {
+                    break;
+                }
+                if (accumulated.endsWith(',') || accumulated.endsWith(';') || nextRow.includes(',')) {
+                    accumulated += ' ' + nextRow;
+                } else {
+                    break;
+                }
+            }
+            if (accumulated.length > 3) {
+                ingredientsText = accumulated.replace(/\b(?:Net\s*(?:Qty|Quantity|Wt|Weight)|MRP|Batch|Exp|Best\s*Before|Mfg|Mfd|Packed|Nutrition|Storage)\b.*/i, '').trim();
+            }
+        }
+    }
+    if (!ingredientsText) {
+        const ingMatch = fullText.match(/(?:Ingredients?|Ingredents?|Ngedients?)\s*[:.-]?\s*([^\n\r]+)/i);
+        if (ingMatch && ingMatch[1].trim().length > 3) {
+            ingredientsText = ingMatch[1].replace(/\b(?:Net\s*(?:Qty|Quantity|Wt|Weight)|MRP|Batch|Exp|Best\s*Before|Mfg|Mfd|Packed|Nutrition|Storage|Directions|Usage)\b.*/i, '').trim();
+        }
     }
     declarations.ingredients = createEvidenceRecord(ingredientsText, null, ingredientsText ? 'verified' : 'not_detected');
 
@@ -641,7 +672,7 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
     const brandCandidates = rawElements.filter(el => {
         const tr = el.text.trim();
         if (tr.length < 4 || tr.length > 40) return false;
-        if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr)) return false;
+        if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr) || isGenericCommodityTerm(tr)) return false;
         if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return false;
         if (/^(?:COMPANY|CORP|CORPORATION|LIMITED|LTD|PVT|LLC|INC)$/i.test(tr)) return false;
         if (/servings?$/i.test(tr) || /ingredients?$/i.test(tr) || /ingredents?$/i.test(tr) || /ceutical/i.test(tr)) return false;
@@ -708,7 +739,7 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
         }
     }
 
-    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal) || isNonProductTitleCandidate(brandNameVal))) {
+    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal) || isNonProductTitleCandidate(brandNameVal) || isGenericCommodityTerm(brandNameVal))) {
         brandNameVal = null;
         brandNameElem = null;
     }

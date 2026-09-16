@@ -196,6 +196,24 @@ const groupIntoRows = (rawElements = []) => {
         columns: r.columns || []
     }));
 
+    if (formattedRows.length === 0 && unpositioned.length > 0) {
+        for (const u of unpositioned) {
+            if ((u.text || '').trim()) {
+                formattedRows.push({
+                    text: (u.text || '').trim(),
+                    elements: [u],
+                    minY: 0,
+                    maxY: 20,
+                    minX: 0,
+                    maxX: 100,
+                    centerY: 10,
+                    height: 20,
+                    columns: []
+                });
+            }
+        }
+    }
+
     return {
         rows: formattedRows,
         orderedElements,

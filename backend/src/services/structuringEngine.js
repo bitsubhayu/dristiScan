@@ -13,11 +13,14 @@ const {
     isNonProductTitleCandidate,
     isValidQuantityUnit,
     validateFieldFormat,
-    sanitizeExtractedText
+    sanitizeExtractedText,
+    isGenericCommodityTerm,
+    isExplicitCountryDeclaration,
+    KNOWN_COUNTRIES
 } = require('./textShapeValidators');
 
 /**
- * 3b. The Legal Metrology packaging structuring system prompt (verbatim).
+ * 3b. The Legal Metrology packaging structuring system prompt.
  */
 const STRUCTURING_SYSTEM_PROMPT = `You are a Legal Metrology packaging structuring engine. You receive OCR
 evidence extracted from photos of a packaged product — organized by
@@ -72,24 +75,41 @@ You MAY correct a value when:
   (b) "character_confusion_fix" — a single character is a well-known OCR
       confusion of another (0/O, 1/I/l, 5/S, 8/B, rn/m) and fixing it
       does not change the word's length or meaning materially.
-  (c) "row_concatenation" — a value (e.g. a price, a date, a title) is
-      visibly split across adjacent cells/rows and you are joining
-      fragments that are already present, not adding new characters
-      beyond what joining requires.
+  (c) "row_concatenation" — a value (e.g. a price, a date, a title, an
+      ingredient declaration) is visibly split across adjacent cells/rows
+      and you are joining fragments that are already present, not adding
+      new characters beyond what joining requires.
   (d) "generic_classification" — for genericCommodityName ONLY, you may
       state the standard common-noun category of the product (e.g.
       "Whey Protein Supplement") even if that exact phrase is not
       printed anywhere, based on the product's other identity evidence.
       This is the ONLY field where this kind of inference is allowed.
 You must NEVER invent a value that is not a minor, evidenced correction
-of the kind above. Example of what is FORBIDDEN: evidence shows only
-"AMU" with no corroborating fuller mention anywhere in any photo, and
-you output "Sunrise" or any other brand name — this is strictly
-forbidden even if such a brand is common or plausible for this product
-category. When you cannot find corroborating evidence for completing a
+of the kind above. When you cannot find corroborating evidence for completing a
 fragment, return the fragment itself as "value" with
 "correctionApplied": false, or return null — never substitute a
 different, unevidenced name.
+
+BRAND NAME VS GENERIC COMMODITY SEPARATION:
+- brandName is the proprietary trade name or umbrella brand of the product.
+- genericCommodityName is the common-noun category of the good (e.g. "Whey Protein Supplement", "Edible Vegetable Oil", "Biscuit").
+- A generic commodity noun or category descriptor (such as "protein", "whey", "milk", "juice", "oil", "flour", "soap", "shampoo", "rice", "dal", "tea", "coffee", "biscuit", "water") must NEVER be output as brandName, even if printed in large bold text, all-caps, or repeatedly across photos.
+- If no distinct proprietary brand name is visible in the evidence, you MUST output "value": null for brandName. Never convert a generic commodity into a brand name.
+
+COUNTRY OF ORIGIN RULES:
+- countryOfOrigin must be extracted from explicit manufacturing/origin declarations such as "Country of Origin", "Made in", "Manufactured in", "Country of Manufacture", "Country Manufactured In", "Product of", "Origin:".
+- "Made in X" / "Manufactured in X" / "Country of Origin: X" are valid evidence.
+- A country mentioned only inside an unrelated corporate address is NOT automatically a country-of-origin declaration.
+- A country mentioned only inside a URL or email (e.g. .in, .uk) must NEVER be treated as country of origin.
+- A country may be accepted when corroborated across photos. Never invent a country.
+
+INGREDIENT DECLARATION RULES:
+- Look for explicit ingredient headings: "Ingredients", "Ingredients:", "Ingredient", and OCR variants.
+- Support ingredient declarations spanning multiple rows. Join adjacent rows when they clearly form one continuous ingredient declaration using "row_concatenation" and cite all contributing rows in groundingRefs.
+- Preserve the actual observed ingredient text as faithfully as possible.
+- Do NOT confuse or merge ingredients with the nutrition facts table, storage instructions, dosage/directions, marketing claims, manufacturing address, or customer care.
+- Never invent missing ingredients. If only part of the declaration is visible, return only supported evidence.
+- Ground the ingredient declaration to every relevant row used.
 
 OTHER EXCLUSION RULES:
 - Never select packaging-handling directives (cut/tear/open/peel/press/
@@ -107,24 +127,47 @@ Respond with a single JSON object only, no prose.`;
 /**
  * 3a. Row-based context builder.
  * Consumes groupIntoRows output per photo and builds a compact row structure.
+ * Preserves lightweight normalized cell bounding boxes [minX, minY, maxX, maxY].
  */
 const buildRowContext = (photoRowsList = []) => {
     return photoRowsList.map(({ photoId, rows }) => ({
         photoId,
         rows: (rows || []).map((row, rowId) => {
-            const cells = Array.isArray(row.cells)
+            const rawCells = Array.isArray(row.cells)
                 ? row.cells
                 : (Array.isArray(row.elements) && row.elements.length > 0)
-                    ? row.elements.map(el => ({
-                        text: el.text || '',
-                        confidence: Math.round((el.confidence || 0.8) * 100) / 100
-                    }))
+                    ? row.elements
                     : (row.text ? [{ text: row.text, confidence: 0.9 }] : []);
+
+            const cells = rawCells.map(el => {
+                const cell = {
+                    text: (el.text || '').trim(),
+                    confidence: typeof el.confidence === 'number' ? Math.round(el.confidence * 100) / 100 : 0.8
+                };
+                const bbox = el.normalizedBbox || el.bbox;
+                if (Array.isArray(bbox) && bbox.length >= 4) {
+                    if (typeof bbox[0] === 'number') {
+                        cell.normalizedBbox = bbox.map(v => Math.round(v * 1000) / 1000);
+                    } else if (Array.isArray(bbox[0])) {
+                        const xs = bbox.map(p => p[0]);
+                        const ys = bbox.map(p => p[1]);
+                        cell.normalizedBbox = [
+                            Math.round(Math.min(...xs) * 1000) / 1000,
+                            Math.round(Math.min(...ys) * 1000) / 1000,
+                            Math.round(Math.max(...xs) * 1000) / 1000,
+                            Math.round(Math.max(...ys) * 1000) / 1000
+                        ];
+                    }
+                }
+                return cell;
+            });
+
+            const rowBbox = row.normalizedBbox || (Array.isArray(row.elements?.[0]?.bbox) ? [row.minX, row.minY, row.maxX, row.maxY] : []);
 
             return {
                 rowId,
                 cells,
-                normalizedBbox: row.normalizedBbox || (Array.isArray(row.elements?.[0]?.bbox) ? [row.minX, row.minY, row.maxX, row.maxY] : [])
+                normalizedBbox: Array.isArray(rowBbox) ? rowBbox : []
             };
         })
     }));
@@ -193,6 +236,36 @@ const validateGrounding = (fieldName, decision, rowLookup, tier = 'strict') => {
     const raw = String(decision.rawObservedText || '').trim();
     const refs = Array.isArray(decision.groundingRefs) ? decision.groundingRefs : [];
 
+    // Generic Commodity vs Brand Identity Separation
+    if (fieldName === 'brandName') {
+        if (isGenericCommodityTerm(value)) {
+            return { status: 'review', value: decision.value, reason: `Generic category/commodity descriptor cannot be brandName: "${value}"` };
+        }
+    }
+
+    // Explicit Country of Origin Validation
+    if (fieldName === 'countryOfOrigin') {
+        if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(value)) {
+            return { status: 'review', value: decision.value, reason: `Contains URL/email — not a valid country: "${value}"` };
+        }
+        const countryCheck = validateFieldFormat('countryOfOrigin', value);
+        if (!countryCheck.valid) {
+            return { status: 'review', value: decision.value, reason: countryCheck.reason };
+        }
+    }
+
+    // Ingredients Safety Validation
+    if (fieldName === 'ingredients') {
+        const lowerVal = value.toLowerCase();
+        if (/^(?:nutrition\s*(?:information|facts)?|nutritional\s*information|supplement\s*facts)\b/i.test(lowerVal) ||
+            /^(?:energy\s*[:.-]?\s*\d|total\s*fat\s*[:.-]?\s*\d|cholesterol\s*[:.-]?\s*\d)/i.test(lowerVal)) {
+            return { status: 'review', value: decision.value, reason: `Nutrition facts panel cited as ingredients: "${value}"` };
+        }
+        if (/^(?:directions?\s*for\s*use|how\s*to\s*use|storage|store\s*in\s*a\s*cool|keep\s*out\s*of\s*reach)\b/i.test(lowerVal)) {
+            return { status: 'review', value: decision.value, reason: `Storage or usage instructions cited as ingredients: "${value}"` };
+        }
+    }
+
     if (tier === 'generic_inferred') {
         // genericCommodityName only — no strict char grounding required,
         // but still require it's not empty and not obviously a rejected shape.
@@ -214,18 +287,27 @@ const validateGrounding = (fieldName, decision, rowLookup, tier = 'strict') => {
     }
 
     if (!decision.correctionApplied) {
-        // Value must closely match at least one cited row's actual text.
-        const matches = refs.some(r => {
-            const rowText = rowLookup.get(`${r.photoId}:${r.rowId}`) || '';
-            if (rowText.toLowerCase().includes(value.toLowerCase()) || value.toLowerCase().includes(rowText.toLowerCase())) return true;
-            const cleanRow = rowText.toLowerCase().replace(/[₹$€£\s,]/g, '');
-            const cleanVal = value.toLowerCase().replace(/[₹$€£\s,]/g, '');
-            if (cleanRow.includes(cleanVal) || cleanVal.includes(cleanRow)) return true;
-            const valDigits = value.replace(/[^0-9]/g, '');
-            const rowDigits = rowText.replace(/[^0-9]/g, '');
-            if (valDigits.length >= 2 && rowDigits.includes(valDigits)) return true;
-            return normalizedEditDistance(value, rowText) <= 0.2;
-        });
+        // Value must match cited row(s). For multi-row ingredients or descriptions, check collective coverage.
+        let matches = false;
+        if (refs.length > 1) {
+            const combined = refs.map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '').join(' ');
+            if (combined.toLowerCase().includes(value.toLowerCase()) || value.toLowerCase().includes(combined.toLowerCase()) || normalizedEditDistance(value, combined) <= 0.25) {
+                matches = true;
+            }
+        }
+        if (!matches) {
+            matches = refs.some(r => {
+                const rowText = rowLookup.get(`${r.photoId}:${r.rowId}`) || '';
+                if (rowText.toLowerCase().includes(value.toLowerCase()) || value.toLowerCase().includes(rowText.toLowerCase())) return true;
+                const cleanRow = rowText.toLowerCase().replace(/[₹$€£\s,]/g, '');
+                const cleanVal = value.toLowerCase().replace(/[₹$€£\s,]/g, '');
+                if (cleanRow.includes(cleanVal) || cleanVal.includes(cleanRow)) return true;
+                const valDigits = value.replace(/[^0-9]/g, '');
+                const rowDigits = rowText.replace(/[^0-9]/g, '');
+                if (valDigits.length >= 2 && rowDigits.includes(valDigits)) return true;
+                return normalizedEditDistance(value, rowText) <= 0.2;
+            });
+        }
         if (!matches) {
             return { status: 'review', value: decision.value, reason: 'Uncorrected value does not match its cited row' };
         }
@@ -388,6 +470,30 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
 
     const declarations = {};
     const validation = {};
+    const diagnostics = {};
+
+    const FIELD_EVIDENCE_PATTERNS = {
+        mrp: /(?:mrp|m\.?\s*r\.?\s*p|max.*retail|rs\.?|₹|\b\d{2,5}\b)/i,
+        netQuantity: /(?:net\s*(?:qty|quantity|weight|wt|vol|contents)|\b\d+(?:\.\d+)?\s*(?:g|gm|kg|ml|l|ltr|pcs|pieces|tablets|capsules))\b/i,
+        batchNumber: /(?:batch|lot|b\.?\s*no)/i,
+        fssaiLicenseNumber: /(?:fssai|lic.*no|\b\d{14}\b)/i,
+        countryOfOrigin: /(?:country\s*of\s*origin|country\s*of\s*manufacture|made\s*in|manufactured\s*in|product\s*of|origin)/i,
+        dateOfManufacture: /(?:mfg|mfd|pkd|packed|date\s*of\s*mfg)/i,
+        dateOfExpiry: /(?:exp|expiry|best\s*before|use\s*by)/i,
+        ingredients: /(?:ingredients?|ingredents?)/i,
+        consumerCarePhone: /(?:helpline|care|phone|tel|contact|\b\d{10,12}\b)/i,
+        consumerCareEmail: /@/,
+        unitSalePrice: /(?:usp|unit\s*sale)/i,
+        nutritionFacts: /(?:nutrition|energy|protein|fat|carbohydrate)/i,
+        manufacturer: /(?:manufactured\s*by|mfd\.?\s*by|mfg\.?\s*by)/i,
+        packer: /(?:packed\s*by|pkd\.?\s*by)/i,
+        importer: /(?:imported\s*by)/i,
+        marketer: /(?:marketed\s*by|mkt\.?\s*by)/i,
+        servingsPerContainer: /(?:servings?\s*per\s*container|\bservings?\b)/i,
+        servingSize: /(?:serving\s*size)/i
+    };
+
+    const allRowTexts = Array.from(rowLookup.values()).join(' ');
 
     // Validate all 20 fields explicitly
     const allFieldKeys = Object.keys(FIELD_TIERS);
@@ -411,12 +517,46 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
                 confidence: typeof decision.confidence === 'number' ? decision.confidence : 0.85,
                 status: Object.keys(validNutrition).length > 0 ? 'verified' : 'not_detected',
                 provenance: 'gpt_oss',
-                source: 'gpt_oss_structuring'
+                source: 'gpt_oss_structuring',
+                diagnostics: {
+                    stage: Object.keys(validNutrition).length > 0 ? 'value_accepted' : 'ocr_evidence_absent',
+                    detail: Object.keys(validNutrition).length > 0 ? 'Verified nutrition facts' : 'No nutrition facts detected'
+                }
             };
+            diagnostics.nutritionFacts = declarations.nutritionFacts.diagnostics;
             continue;
         }
 
         const grounded = validateGrounding(fieldKey, decision, rowLookup, tier);
+
+        const pat = FIELD_EVIDENCE_PATTERNS[fieldKey];
+        const rowHasEvidence = pat ? pat.test(allRowTexts) : false;
+
+        let diagnosticStage = 'ocr_evidence_absent';
+        let diagnosticDetail = 'No evidence found for this field in OCR results';
+
+        if (grounded.status === 'verified') {
+            diagnosticStage = 'value_accepted';
+            diagnosticDetail = 'Verified against grounded OCR evidence';
+        } else if (decision.value !== null && decision.value !== undefined && decision.value !== '') {
+            diagnosticStage = 'grounding_rejected';
+            diagnosticDetail = grounded.reason || 'Grounding gate rejected proposed value';
+        } else if (decision.value === null || decision.value === undefined) {
+            if (rowHasEvidence) {
+                diagnosticStage = 'gpt_returned_null';
+                diagnosticDetail = 'Evidence was present in reconstructed rows but GPT-OSS returned null';
+            } else {
+                diagnosticStage = 'ocr_evidence_absent';
+                diagnosticDetail = 'No evidence found in OCR text or rows';
+            }
+        }
+
+        const fieldDiagnostics = {
+            stage: diagnosticStage,
+            detail: diagnosticDetail,
+            proposedValue: decision.value !== undefined ? decision.value : null
+        };
+        diagnostics[fieldKey] = fieldDiagnostics;
 
         declarations[fieldKey] = {
             value: grounded.value,
@@ -429,7 +569,8 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
             groundingRefs: decision.groundingRefs || [],
             source: 'gpt_oss_structuring',
             aiAssisted: true,
-            reason: grounded.reason || null
+            reason: grounded.reason || null,
+            diagnostics: fieldDiagnostics
         };
 
         validation[fieldKey] = {
@@ -594,6 +735,7 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
         normalizedFields,
         declarations,
         validation,
+        diagnostics,
         rawResult: parsedContent,
         latencyMs: result.latencyMs,
         usage: result.usage

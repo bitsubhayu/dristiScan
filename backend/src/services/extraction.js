@@ -10,6 +10,7 @@
 
 const structuringEngine = require('./structuringEngine');
 const { extractFieldsDeterministic } = require('./deterministicFallbackExtractor');
+const { fuseMultiPhotoEvidence } = require('./multiPhotoEvidenceFusion');
 const {
     isDateShaped,
     VALID_MASS_VOLUME_UNITS,
@@ -79,6 +80,42 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1', options = {}) => {
         return entry;
     }).filter(r => Boolean(r.text));
 
+    // Attach normalizedBbox to row elements
+    const normalizedRows = (structuredRows.rows || []).map(r => ({
+        ...r,
+        elements: (r.elements || []).map(el => {
+            const elEntry = { ...el };
+            if (sourceImageWidth > 0 && sourceImageHeight > 0 && Array.isArray(el.bbox) && el.bbox.length >= 4) {
+                if (typeof el.bbox[0] === 'number') {
+                    elEntry.normalizedBbox = [
+                        Math.round((el.bbox[0] / sourceImageWidth) * 1000) / 1000,
+                        Math.round((el.bbox[1] / sourceImageHeight) * 1000) / 1000,
+                        Math.round((el.bbox[2] / sourceImageWidth) * 1000) / 1000,
+                        Math.round((el.bbox[3] / sourceImageHeight) * 1000) / 1000
+                    ];
+                } else if (Array.isArray(el.bbox[0])) {
+                    const xs = el.bbox.map(pt => pt[0] / sourceImageWidth);
+                    const ys = el.bbox.map(pt => pt[1] / sourceImageHeight);
+                    elEntry.normalizedBbox = [
+                        Math.round(Math.min(...xs) * 1000) / 1000,
+                        Math.round(Math.min(...ys) * 1000) / 1000,
+                        Math.round(Math.max(...xs) * 1000) / 1000,
+                        Math.round(Math.max(...ys) * 1000) / 1000
+                    ];
+                }
+            }
+            return elEntry;
+        }),
+        normalizedBbox: (sourceImageWidth > 0 && sourceImageHeight > 0 && r.minX !== undefined)
+            ? [
+                Math.round((r.minX / sourceImageWidth) * 1000) / 1000,
+                Math.round((r.minY / sourceImageHeight) * 1000) / 1000,
+                Math.round((r.maxX / sourceImageWidth) * 1000) / 1000,
+                Math.round((r.maxY / sourceImageHeight) * 1000) / 1000
+              ]
+            : (r.normalizedBbox || [])
+    }));
+
     const emptyNormalized = {
         productName: null,
         brandName: null,
@@ -108,7 +145,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1', options = {}) => {
             carbohydrates: null,
             fiber: null
         },
-        structuredRows: structuredRows.rows,
+        structuredRows: normalizedRows,
         rawOcrText: normalizedRawOcr
     };
 
@@ -122,8 +159,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1', options = {}) => {
         declarations: {},
         validation: {},
         sourceImageId,
-        structuredRows: structuredRows.rows,
-        _structuredRowsObj: structuredRows,
+        structuredRows: normalizedRows,
+        _structuredRowsObj: { ...structuredRows, rows: normalizedRows },
         candidateHints,
         rawOcrText: normalizedRawOcr,
         imageWidth: sourceImageWidth,
@@ -164,8 +201,13 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
         }
     });
 
-    // Attempt unified structuring via structuringEngine (GPT-OSS)
-    const structureResult = await structuringEngine.structureFields(photoRowsList, deterministicHints);
+    // Step 2 & 5: Lightweight deterministic multi-photo evidence fusion
+    const fusionStart = Date.now();
+    const fusionResult = fuseMultiPhotoEvidence(photoRowsList);
+    const fusionLatencyMs = Date.now() - fusionStart;
+
+    // Attempt unified structuring via structuringEngine (GPT-OSS) exactly ONCE
+    const structureResult = await structuringEngine.structureFields(fusionResult.fusedPhotoRows, deterministicHints);
 
     if (structureResult.success) {
         const normalizedFields = {
@@ -182,7 +224,10 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
             reconciliation: {
                 fields: {},
                 conflicts: [],
-                gptOssUsed: true
+                gptOssUsed: true,
+                fusionStats: fusionResult.stats,
+                fusionLatencyMs,
+                diagnostics: structureResult.diagnostics || {}
             },
             normalizedFields
         };

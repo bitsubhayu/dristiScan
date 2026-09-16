@@ -508,7 +508,22 @@ function ConsumerView({ onSwitchToOfficer }) {
               <FieldCard label="Manufacturer Name" value={fields.manufacturer?.name} aiAssisted={isAiAssisted('manufacturer.name')} />
               {fields.manufacturer?.address && <FieldCard label="Manufacturer Address" value={fields.manufacturer.address} aiAssisted={isAiAssisted('manufacturer.address')} />}
               <FieldCard label="Country of Origin" value={fields.countryOfOrigin} aiAssisted={isAiAssisted('countryOfOrigin')} />
-              <FieldCard label="Ingredients List" value={fields.ingredients} />
+            </div>
+          </div>
+
+          {/* 6. Ingredients Declaration */}
+          <div className="card">
+            <h2 className="card-title">Ingredients Declaration</h2>
+            <div style={{ padding: '0.25rem 0' }}>
+              <div className="field-card" style={{ width: '100%' }}>
+                <div className="field-label">
+                  <span>Declared Ingredients</span>
+                  {isAiAssisted('ingredients') && <span className="ai-badge" title="Couldn't be read clearly from the photo — please double-check this value.">Check Value</span>}
+                </div>
+                <div className={`field-value ${!fields.ingredients ? 'empty' : ''}`} style={{ whiteSpace: 'pre-wrap', lineHeight: '1.5' }}>
+                  {fields.ingredients ? sanitizeText(fields.ingredients) : 'Not detected on package label'}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -1084,6 +1099,22 @@ function OfficerScanView({ user, onNavigateToRepo }) {
                   {fields.consumerCare?.address && (
                     <DeclField label="Consumer Care Address" value={fields.consumerCare.address} wide />
                   )}
+                </div>
+              </div>
+
+              {/* Group F: Ingredients Declaration */}
+              <div className="decl-section">
+                <div className="decl-section-header">
+                  <div className="decl-section-icon"><FileText size={11} /></div>
+                  Ingredients Declaration
+                </div>
+                <div className="decl-fields-grid">
+                  <DeclField
+                    label="Declared Ingredients"
+                    value={fields.ingredients}
+                    aiAssisted={isAiAssisted('ingredients')}
+                    wide
+                  />
                 </div>
               </div>
 
