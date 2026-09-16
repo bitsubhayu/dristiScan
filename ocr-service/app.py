@@ -182,8 +182,86 @@ def run_tiled_ocr(img):
     # Deduplicate overlapping detections
     return deduplicate_results(all_results)
 
+def sort_results_spatially(results):
+    """Sort OCR detections in natural visual reading order: top-to-bottom, left-to-right.
+    Groups detections into visual rows using vertical center and bounding box height,
+    then sorts elements within each row left-to-right by horizontal position.
+    Preserves all confidence and metadata.
+    """
+    if len(results) <= 1:
+        return results
+
+    valid_elements = []
+    empty_elements = []
+
+    for r in results:
+        bbox = r.get("bbox", [])
+        if bbox and len(bbox) >= 4:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            height = max(1.0, float(y_max - y_min))
+            center_y = (y_min + y_max) / 2.0
+            valid_elements.append({
+                "item": r,
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+                "center_y": center_y,
+                "height": height
+            })
+        else:
+            empty_elements.append(r)
+
+    if not valid_elements:
+        return results
+
+    # Initial coarse sort by vertical position then horizontal position
+    valid_elements.sort(key=lambda e: (e["y_min"], e["x_min"]))
+
+    # Group into visual rows based on vertical proximity and overlap
+    rows = []
+    for elem in valid_elements:
+        matched_row = None
+        for row in rows:
+            row_cy = row["center_y"]
+            row_h = row["height"]
+            vertical_tol = max(row_h, elem["height"]) * 0.5
+            if abs(elem["center_y"] - row_cy) <= vertical_tol:
+                matched_row = row
+                break
+
+        if matched_row is not None:
+            matched_row["elements"].append(elem)
+            n = len(matched_row["elements"])
+            matched_row["center_y"] = ((matched_row["center_y"] * (n - 1)) + elem["center_y"]) / n
+            matched_row["height"] = max(matched_row["height"], elem["height"])
+        else:
+            rows.append({
+                "center_y": elem["center_y"],
+                "height": elem["height"],
+                "elements": [elem]
+            })
+
+    # Sort rows top-to-bottom by center_y
+    rows.sort(key=lambda r: r["center_y"])
+
+    # Sort elements within each row left-to-right by x_min
+    sorted_results = []
+    for row in rows:
+        row["elements"].sort(key=lambda e: e["x_min"])
+        for e in row["elements"]:
+            sorted_results.append(e["item"])
+
+    sorted_results.extend(empty_elements)
+    return sorted_results
+
 def deduplicate_results(results):
-    """Remove duplicate detections from overlapping tiles using bbox IoU."""
+    """Remove duplicate detections from overlapping tiles using bbox IoU.
+    Final output is spatially ordered: top-to-bottom, left-to-right.
+    """
     if len(results) <= 1:
         return results
 
@@ -206,7 +284,7 @@ def deduplicate_results(results):
         if not is_duplicate:
             kept.append(candidate)
 
-    return kept
+    return sort_results_spatially(kept)
 
 
 # =============================================================================
@@ -373,7 +451,7 @@ async def perform_ocr(image: UploadFile = File(...)):
             "detLimitSideLen": 2560,
             "recScoreThresh": 0.3
         },
-        "results": formatted_results
+        "results": sort_results_spatially(formatted_results)
     }
 
 if __name__ == "__main__":

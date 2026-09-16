@@ -73,9 +73,53 @@ const localReconcileFields = (candidatesByField) => {
         if (!candidates || candidates.length === 0) continue;
 
         if (candidates.length === 1) {
+            const rawVal = candidates[0].value !== undefined && candidates[0].value !== null ? String(candidates[0].value).trim() : '';
+            if (!rawVal) {
+                reconciledFields[field] = {
+                    value: null,
+                    reasoning: "Empty candidate value rejected",
+                    isConflict: false
+                };
+                continue;
+            }
+
+            // Generic identity validation: reject date-shaped, promotional badges, or instructional directives
+            const isIdentityField = (field === 'productName' || field === 'brandName' || field === 'genericCommodityName');
+            if (isIdentityField) {
+                const isDate = /^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(rawVal) ||
+                    /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/.test(rawVal) ||
+                    /\b(?:EXP|MFG|BEST\s*BEFORE|USE\s*BY)\b/i.test(rawVal);
+                const isBadge = /^(?:100%|authentic|certified|pure|natural|premium|quality|original|fresh|best|new|free|rich\s*in|high\s*in|zero|no\s*added|iso\s*\d+|gmp|halal|tested)\b/i.test(rawVal);
+                const isInstruction = /\b(?:cut|tear|open|peel|pull|press|push|twist|fold|snip|lift)\b.{0,20}\b(?:here|along|this\s*(?:line|side|edge)|dotted\s*line|perforat\w*|to\s*open|tab|corner)\b/i.test(rawVal) ||
+                    /^(?:cut|tear|open|peel|pull|press|push|twist|fold|snip)\s+(?:here|from\s*here|along|this|the|open|carefully)/i.test(rawVal);
+
+                if (rawVal.length < 2 || isDate || isBadge || isInstruction) {
+                    reconciledFields[field] = {
+                        value: null,
+                        reasoning: `Rejected by generic identity candidate validation: "${rawVal}"`,
+                        isConflict: false
+                    };
+                    continue;
+                }
+
+                // If candidate survived an unresolved identity collision without semantic verification,
+                // do not confidently accept it as a single candidate
+                const hasCollision = candidates[0].identityCollision || candidates[0].unresolvedCollision ||
+                    (candidatesByField.productName || []).some(c => c.identityCollision) ||
+                    (candidatesByField.brandName || []).some(c => c.identityCollision);
+                if (hasCollision && (field === 'productName' || field === 'brandName')) {
+                    reconciledFields[field] = {
+                        value: null,
+                        reasoning: `Unresolved identity collision for ${field} without semantic arbitration`,
+                        isConflict: true
+                    };
+                    continue;
+                }
+            }
+
             reconciledFields[field] = {
-                value: candidates[0].value,
-                reasoning: "Single candidate value accepted",
+                value: rawVal,
+                reasoning: "Single candidate value accepted after validation",
                 isConflict: false
             };
             continue;
@@ -285,7 +329,8 @@ Respond in this exact JSON format (no markdown, no code fences):
         };
     } catch (err) {
         console.error('[GeminiService] Reconciliation API error:', err.message);
-        return { reconciledFields: {}, brandClassification: null, skipped: false, error: err.message };
+        const fallback = localReconcileFields(candidatesByField);
+        return { ...fallback, error: err.message };
     }
 };
 
