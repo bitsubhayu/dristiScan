@@ -1,709 +1,41 @@
 /**
- * DrishtiScan Extraction & Multi-Angle Reconciliation Engine
+ * DrishtiScan — Extraction & Multi-Angle Reconciliation Engine
  * Canonical Data Contract & Evidence-Based Legal Metrology Extraction
  * 
- * Phase 5 Enhancements:
- * - Provenance tracking: source, aiAssisted, reconciledFrom fields
- * - Spatial bounding-box label-value pairing (Fix 3)
- * - Gemini semantic reconciliation integration (Fix 1)
- * - Gemini fallback for low-confidence fields (Fix 2)
+ * Redesigned Architecture:
+ * - extractFields: single-photo evidence reconstruction (groupIntoRows, candidateHints, normalized bboxes)
+ * - mergeMultiPhotoExtractedFields: consolidated multi-angle structuring via structuringEngine (GPT-OSS)
+ *   with deterministicFallbackExtractor as degraded safety fallback.
  */
 
-const geminiService = require('./geminiService');
-const gptOssService = require('./gptOssService');
+const structuringEngine = require('./structuringEngine');
+const { extractFieldsDeterministic } = require('./deterministicFallbackExtractor');
+const {
+    isDateShaped,
+    VALID_MASS_VOLUME_UNITS,
+    VALID_COUNT_UNITS,
+    isValidQuantityUnit,
+    MARKETING_BADGE_PATTERNS,
+    isMarketingBadge,
+    isNonProductTitleCandidate,
+    validateFieldFormat,
+    KNOWN_COUNTRIES,
+    sanitizeExtractedText
+} = require('./textShapeValidators');
+const {
+    groupIntoRows,
+    generateCandidateTitles
+} = require('./ocrReconstruction');
 
 /**
- * Phase 6 (Audit Fix): Named confidence threshold for deciding when a field
- * needs the Gemini fallback. Any field with confidence below this value
- * (and above 0) is sent to Gemini for re-reading.
- * Configurable via environment variable GEMINI_FALLBACK_THRESHOLD.
- */
-const GEMINI_FALLBACK_CONFIDENCE_THRESHOLD = parseFloat(
-    process.env.GEMINI_FALLBACK_THRESHOLD || '0.4'
-);
-
-/**
- * Phase 6 (Audit Fix): Strict schema validation for Gemini structuring output.
- * Rejects any Gemini response that doesn't match the expected shape, preventing
- * misplaced values (e.g., quantity appearing under productName).
- */
-/**
- * Helper: Detect if a string is shaped like a calendar date.
- * Matches standard date formats (DD/MM/YYYY, MM/YYYY, Month YYYY, etc.).
- * Identity fields (productName, brandName, genericCommodityName) must NEVER match this.
- */
-const isDateShaped = (text) => {
-    if (!text || typeof text !== 'string') return false;
-    const s = text.trim();
-    if (s.length < 3) return false;
-    if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(s)) return true;
-    if (s.length < 4) return false;
-    if (/\d{1,2}:\d{2}/.test(s)) return true;
-    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(s)) return true;
-    if (/\b\d{1,2}[/]\d{2,4}\b/.test(s)) return true;
-    if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
-    if (/\b\d{1,2}[\s./-]+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]+\d{2,4}\b/i.test(s)) return true;
-    if (/\b(?:BEST\s*BEFORE|EXP|EXPIRY|USE\s*BY|MFG|MFD|PKD|PACKED)\b/i.test(s) && /\d/.test(s)) return true;
-    return false;
-};
-
-/**
- * Valid standard metric mass/volume units and packaging count units.
- * Non-units such as "n", "u", "ch", or arbitrary noise tokens must be rejected.
- */
-const VALID_MASS_VOLUME_UNITS = new Set([
-    'g', 'gm', 'gms', 'gram', 'grams',
-    'kg', 'kgs', 'kilogram', 'kilograms',
-    'mg', 'milligram', 'milligrams',
-    'ml', 'mls', 'millilitre', 'millilitres', 'milliliter', 'milliliters',
-    'l', 'lt', 'ltr', 'litre', 'litres', 'liter', 'liters',
-    'cl'
-]);
-
-const VALID_COUNT_UNITS = new Set([
-    'capsules', 'capsule', 'tablets', 'tablet',
-    'softgels', 'softgel', 'pieces', 'piece',
-    'sachets', 'sachet', 'units', 'unit',
-    'packs', 'pack', 'candies', 'gummies',
-    'bars', 'pouches', 'vials', 'ampoules',
-    'rolls', 'sheets', 'wipes'
-]);
-
-const isValidQuantityUnit = (unit) => {
-    if (!unit || typeof unit !== 'string') return false;
-    const u = unit.trim().toLowerCase();
-    return VALID_MASS_VOLUME_UNITS.has(u) || VALID_COUNT_UNITS.has(u);
-};
-
-/**
- * Phase 6 (Audit Fix): Strict schema validation for Gemini structuring output.
- * Rejects any Gemini response that doesn't match the expected shape, preventing
- * misplaced values (e.g., quantity appearing under productName).
- */
-const validateGeminiFieldResult = (field, data) => {
-    if (!data || typeof data !== 'object') return null;
-    if (data.value === null || data.value === undefined) return null;
-    // Value must be a string or number
-    if (typeof data.value !== 'string' && typeof data.value !== 'number') return null;
-    // Reject suspiciously short values (likely noise)
-    if (typeof data.value === 'string' && data.value.trim().length === 0) return null;
-    
-    // Field-specific validation: identity fields
-    if (field === 'productName' || field === 'brandName' || field === 'genericCommodityName' ||
-        field === 'manufacturer.name' || field === 'marketer.name') {
-        const val = String(data.value).trim();
-        // Reject if value is date-shaped
-        if (isDateShaped(val)) return null;
-        // Reject if marketing badge
-        if (isMarketingBadge(val)) return null;
-        // Reject if value looks like a quantity ("500 ml", "1 kg") or price ("₹120")
-        if (/^\d+(\.\d+)?\s*(ml|g|kg|l|mg|mcg|oz|lb)$/i.test(val)) return null;
-        if (/^[₹$€£]?\s*\d+(\.\d+)?$/.test(val)) return null;
-    }
-    // Net quantity validation: must have valid metric or count unit
-    if (field === 'netQuantity') {
-        const nqm = String(data.value).match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-        if (nqm) {
-            if (!isValidQuantityUnit(nqm[2])) return null;
-        }
-    }
-    // Date validation
-    if (field === 'dates.manufacture' || field === 'dates.expiry') {
-        const fmt = validateFieldFormat(field, data.value);
-        if (!fmt.valid) return null;
-    }
-    // For price fields, value should be numeric or a price string
-    if (field === 'mrp' || field === 'unitSalePrice') {
-        const numVal = parseFloat(String(data.value).replace(/[₹$€£,\s]/g, ''));
-        if (isNaN(numVal)) return null;
-    }
-    return { value: data.value, reasoning: data.reasoning || 'Gemini fallback' };
-};
-
-/**
- * Marketing/quality badge patterns that must NEVER be treated as brand,
- * product, or generic commodity name. These are promotional declarations,
- * not identity declarations.
- */
-const MARKETING_BADGE_PATTERNS = [
-    /100\s*%\s*(?:authentic|pure|natural|organic|vegetarian|veg|genuine)/i,
-    /\b(?:certified|premium|quality|original|guaranteed|approved|tested|verified)\b/i,
-    /\b(?:ISO|GMP|HACCP|WHO|GLP)\s*(?:certified|approved)?\b/i,
-    /\b(?:Halal|Kosher|Vegan|Gluten\s*Free)\s*(?:Certified)?\b/i,
-    /\b(?:award|winning|best|trusted|leading|no\.?\s*1)\b/i,
-    /\b(?:clinically|scientifically|lab)\s*(?:tested|proven|validated)\b/i,
-    /\b(?:money\s*back|satisfaction)\s*(?:guarantee)?\b/i,
-    /\b(?:new|improved|advanced|ultra|super|mega|pro|max)\b/i,
-    /^\s*(?:made\s*in|product\s*of|manufactured|marketed|packed|imported)\b/i,
-];
-
-/**
- * Check if a text string is a marketing badge / quality claim, not an identity declaration.
- */
-const isMarketingBadge = (text) => {
-    if (!text || typeof text !== 'string') return false;
-    const t = text.trim();
-    if (t.length < 3) return false;
-    return MARKETING_BADGE_PATTERNS.some(p => p.test(t));
-};
-
-/**
- * Filter out non-product-title candidates across 13 rejection categories.
- * Moved to module scope for uniform validation across deterministic extraction,
- * GPT-OSS 120B output validation, and Gemini reconciliation validation.
- */
-const isNonProductTitleCandidate = (rawText) => {
-    if (!rawText || typeof rawText !== 'string') return true;
-    const tr = rawText.trim();
-    if (tr.length < 2 || tr.length > 70) return true;
-
-    // 1. Single character or isolated symbols
-    if (/^[^\w\s]+$/.test(tr) || tr.length === 1) return true;
-
-    // 2. Pure digits, decimals, times, pure punctuation, or phone numbers
-    if (/^\d+(?:\.\d+)?$/.test(tr)) return true;
-    if (/^\d+\.\d{2}$/.test(tr)) return true;
-    if (/\d{1,2}:\d{2}/.test(tr)) return true;
-    if (/^[+\d\s\-().]{7,25}$/.test(tr)) return true;
-
-    // 3. Quantities, dosages, servings, counts, and standalone units:
-    if (/^\s*\d+(?:\.\d+)?\s*(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|cl|oz|fl\s*oz|pt|kcal|tablets?|capsules?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|servings?|count|ct)\b/i.test(tr)) return true;
-    if (/^\s*(?:approx\.?\s*)?\d+(?:\.\d+)?\s*(?:mg|g|ml|kg|l)\b/i.test(tr)) return true;
-    if (/^\s*(?:\d+\s*)?(?:capsules?|tablets?|softgels?|cap|caps|tabs?|pcs|pieces?|units?|sachets?|scoop)[:.-]?$/i.test(tr)) return true;
-    if (/^\s*(?:\d+\s*)?(?:servings?|servings?\s*per\s*container)[:.-]?/i.test(tr)) return true;
-    if (/servings?$/i.test(tr)) return true;
-    if (/^\d+\s*Capsule\s*\(/i.test(tr)) return true;
-
-    const withoutNum = tr.replace(/[\d.,+\-/()%\s]/g, '').toLowerCase();
-    if (withoutNum.length > 0 && /^(?:mg|g|gm|gms|kg|kgs|ml|mls|l|lt|ltr|oz|pt|kcal|mcg|tablets?|capsules?|softgels?|servings?)$/i.test(withoutNum)) return true;
-
-    // 4. Prices, taxes, and currency:
-    if (/[₹$€£]/.test(tr)) return true;
-    if (/\b(?:rs\.?|inr)\s*[:.-]?\s*\d+/i.test(tr)) return true;
-    if (/\b(?:mrp|usp|unit\s*sale\s*price|max\s*retail)\b/i.test(tr)) return true;
-    if (/\b\d+(?:\.\d+)?\s*\/\s*(?:cap|tab|g|kg|ml|unit|pc|piece)\b/i.test(tr)) return true;
-    if (/\b(?:taxes?|tax\b|incl\.?\s*of|inclusive\s*of)\b/i.test(tr)) return true;
-    if (/^\(?cincl\.?of/i.test(tr)) return true;
-
-    // 5. Dates, months, timestamps, and packaging codes:
-    if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(tr)) return true;
-    if (/\b\d{1,2}[/]\d{2,4}\b/.test(tr)) return true;
-    if (/\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\s./-]*\d{2,4}\b/i.test(tr)) return true;
-    if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return true;
-    if (/\b(?:mfg|pkd|exp|expiry|best\s*before|use\s*by|packed\s*on)\b/i.test(tr)) return true;
-
-    // 6. Batch / Lot / Serial numbers:
-    if (/\b(?:batch|lot|b\.?\s*no\.?)\b/i.test(tr)) return true;
-    if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return true;
-    if (/^B\d{4,}$/i.test(tr)) return true;
-
-    // 7. Regulatory, Licenses, Standards, Barcodes:
-    if (/\b(?:fssai|lic\.?\s*no\.?|license)\b/i.test(tr)) return true;
-    if (/^\d{14}$/.test(tr)) return true;
-    if (/\d{5,}"\d{5,}/.test(tr)) return true;
-    if (/\b(?:ICMR|RDA|WHO|GMP|ISO|HACCP)\b/i.test(tr)) return true;
-    if (/percent\s*rda|guideline\s*2020|medical\s*research/i.test(tr)) return true;
-
-    // 8. Additives, INS numbers, Excipients:
-    if (/INS\s*\d+/i.test(tr)) return true;
-    if (/\b(?:preservative|humectant|emulsifier|stabilizer|thickener|acidity\s*regulator|anti-caking)\b/i.test(tr)) return true;
-    if (/^-\s*(?:monounsaturated|polyunsaturated|saturated|trans\s*fat|cholesterol|epa|dha)/i.test(tr)) return true;
-
-    // 9. Nutrition panel & Ingredients headers/rows:
-    if (/^(?:nutrition\s*(?:information|facts)?|nutritional\s*information|supplement\s*facts|ingredients?|ingredents?|ngedients?)\s*[:.-]?$/i.test(tr)) return true;
-    if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?\s*(?:\d|<|>|nil|trace|none|\bper\b|\bamount\b|\bg\b|\bmg\b|\bkcal\b)/i.test(tr)) return true;
-    if (/^(?:energy|protein|fat|total\s*fat|carbohydrate|carbs?|total\s*sugars?|added\s*sugars?|sodium|cholesterol|dietary\s*fiber)\s*[:.-]?$/i.test(tr)) return true;
-    if (/\b(?:per\s*serving|amount\s*per\s*serving|daily\s*value|\bper\s*100g?\b)\b/i.test(tr)) return true;
-    if (/^allergens?\b/i.test(tr)) return true;
-
-    // 10. Contact, Customer care, URLs, Phones, Feedback:
-    if (/^(?:customer|consumer|client)\b/i.test(tr)) return true;
-    if (/\b(?:customer\s*care|consumer\s*care|for\s*feedback|helpline|toll\s*free|call\s*1-|call\s*\+91)\b/i.test(tr)) return true;
-    if (/\b(?:https?:\/\/|www\.|\.(?:com|org|net|in|co|gov|edu)\b)/i.test(tr)) return true;
-    if (/^(?:visit|check|browse|follow|refer\s*to)\s+(?:us|our|online|website|at|for|more)?\b/i.test(tr)) return true;
-
-    // 11. Storage instructions & Disclaimers:
-    if (/\b(?:store\s*in|keep\s*in|cool\s*and\s*dry|direct\s*sunlight|keep\s*out\s*of\s*reach|how\s*to\s*use|directions?\s*for\s*use)\b/i.test(tr)) return true;
-    if (/\b(?:not\s*for\s*medicinal|not\s*to\s*exceed|consult\s*your)\b/i.test(tr)) return true;
-
-    // 12. Corporate suffixes, Legal clauses, Manufacturing notes, and Sentence fragments:
-    if (/[,;.]$/.test(tr)) return true; // Sentence fragments ending with punctuation
-    if (/^(?:for|to|and|with|our|from|in|on|at|by|of)\s+/i.test(tr)) return true; // Prepositional phrases
-    if (/\b(?:feedback|customer|consumer|our\s*products?)\b/i.test(tr)) return true;
-    if (/^(?:the|and|or|for|with|from|this|that|these|those|our|your|their|are|was|were|been|have|has|had|not|can|may|will|would|should|could|online)$/i.test(tr)) return true; // Isolated stop words
-    if (/^(?:ation|tion|sion|ment|ties|ness|able|ible|ised|ized|tured|ing|ed)$/i.test(tr)) return true; // Isolated morphemes / clipped suffixes
-    if (/\b(?:manufactured\s*by|marketed\s*by|packed\s*by|imported\s*by|mfd\.?\s*by|pkd\.?\s*by|made\s*in\b)/i.test(tr)) return true;
-    if (/\b(?:is|are|was|were|been|being)\s+(?:manufactured|packed|marketed|distributed|produced|formulated|made|bottled|processed)\b/i.test(tr)) return true; // Passive manufacturing clauses
-    if (/\b(?:recycle|recyclable|no\s*refill|please\s*recycle|crush\s*the\s*bottle|dispose\s*of)\b/i.test(tr)) return true; // Generic packaging handling directives
-    if (/\b(?:proof\s*of\s*purch(?:ase)?|code\s*under\s*(?:the\s*)?cap|scratch\s*code|scan\s*qr|scan\s*to\s*win)\b/i.test(tr)) return true; // Generic consumer packaging promotions
-    if (/^(?:share|enjoy|taste|try|feel|drink|serve|refresh)\s+(?:a|an|the|our|this)\b/i.test(tr)) return true; // Generic imperative marketing slogans
-    if (/^[a-z0-9\s]+:$/i.test(tr)) return true;
-
-    // 13. Imperative / procedural packaging-handling directives — generic,
-    // not tied to any specific product (e.g. cut-here marks, tear lines,
-    // twist-open caps, peel tabs). These are printed instructions for
-    // handling the package, never the product's identity.
-    if (/\b(?:cut|tear|open|peel|pull|press|push|twist|fold|snip|lift)\b.{0,20}\b(?:here|along|this\s*(?:line|side|edge)|dotted\s*line|perforat\w*|to\s*open|tab|corner)\b/i.test(tr)) return true;
-    if (/^(?:cut|tear|open|peel|pull|press|push|twist|fold|snip)\s+(?:here|from\s*here|along|this|the|open|carefully)/i.test(tr)) return true;
-    if (/\b(?:dotted|perforated)\s*line\b/i.test(tr)) return true;
-
-    return false;
-};
-
-/**
- * Post-extraction format validator for fields with well-defined shapes.
- * Returns { valid: true, value } if the value conforms, or { valid: false, reason } if not.
- * Non-conforming values should be marked REVIEW, not accepted as-is.
- */
-const validateFieldFormat = (fieldName, value) => {
-    if (value === null || value === undefined) return { valid: true, value: null };
-
-    switch (fieldName) {
-        case 'productName':
-        case 'brandName':
-        case 'genericCommodityName': {
-            const str = String(value).trim();
-            if (isDateShaped(str)) {
-                return { valid: false, reason: `Field value "${str}" is date-shaped — rejected` };
-            }
-            if (isMarketingBadge(str)) {
-                return { valid: false, reason: `Field value "${str}" is a promotional/marketing badge — rejected` };
-            }
-            if (isNonProductTitleCandidate(str)) {
-                return { valid: false, reason: `Rejected by identity-candidate filter: "${str}"` };
-            }
-            if (str.length < 2) {
-                return { valid: false, reason: 'Too short to be a valid identity declaration' };
-            }
-            return { valid: true, value: str };
-        }
-        case 'netQuantity': {
-            if (value && typeof value === 'object') {
-                const { value: val, unit } = value;
-                if (val === null || val === undefined || isNaN(parseFloat(val)) || parseFloat(val) <= 0) {
-                    return { valid: false, reason: 'Net quantity has non-numeric or non-positive value' };
-                }
-                if (!isValidQuantityUnit(unit)) {
-                    return { valid: false, reason: `Unit "${unit}" is not a recognized standard metric or count unit` };
-                }
-                return { valid: true, value };
-            }
-            const rawStr = String(value);
-            if (/(?:protein|carbohydrate|fat|sugar|sodium|fiber|energy|kcal|ingredient|preservative|humectant|acid|how\s*to|direction|storage)/i.test(rawStr)) {
-                return { valid: false, reason: 'Contains ingredient/nutrition text — not a valid net quantity' };
-            }
-            const wordCount = rawStr.trim().split(/\s+/).length;
-            if (wordCount > 5) {
-                return { valid: false, reason: `Net quantity has ${wordCount} words — likely contaminated with adjacent text` };
-            }
-            const nqm = rawStr.match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-            if (nqm && !isValidQuantityUnit(nqm[2])) {
-                return { valid: false, reason: `Unit "${nqm[2]}" is not a recognized standard metric or count unit` };
-            }
-            return { valid: true, value };
-        }
-        case 'mrp': {
-            const num = parseFloat(String(value));
-            if (isNaN(num) || num <= 0 || num > 500000) {
-                return { valid: false, reason: 'MRP is not a valid positive number' };
-            }
-            return { valid: true, value: num };
-        }
-        case 'unitSalePrice': {
-            if (!/\d/.test(String(value))) {
-                return { valid: false, reason: 'Unit sale price contains no numeric component' };
-            }
-            return { valid: true, value };
-        }
-        case 'dates.manufacture':
-        case 'dates.expiry': {
-            const dateStr = String(value).trim();
-            // Must contain at least a month or number pattern
-            if (!/(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|\d{1,2}[/-]\d{2,4})/i.test(dateStr)) {
-                return { valid: false, reason: 'Does not match any recognized date format' };
-            }
-            // Disallow obvious non-date artifacts like "DECD 50"
-            const monthWordMatch = dateStr.match(/^([A-Za-z]+)\s*(\d+)$/);
-            if (monthWordMatch) {
-                const VALID_MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
-                                      'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
-                if (!VALID_MONTHS.includes(monthWordMatch[1].toUpperCase())) {
-                    return { valid: false, reason: `"${monthWordMatch[1]}" is not a recognized calendar month` };
-                }
-            }
-            return { valid: true, value };
-        }
-        case 'batchNumber': {
-            const batch = String(value).trim();
-            if (batch.length < 3 || batch.length > 25) {
-                return { valid: false, reason: `Batch number length ${batch.length} is outside expected 3-25 chars` };
-            }
-            if (!/[A-Za-z0-9]/.test(batch)) {
-                return { valid: false, reason: 'Batch number contains no alphanumeric characters' };
-            }
-            return { valid: true, value };
-        }
-        case 'fssaiLicenseNumber': {
-            const fssai = String(value).trim();
-            if (!/^\d{14}$/.test(fssai)) {
-                return { valid: false, reason: 'FSSAI license must be exactly 14 digits' };
-            }
-            return { valid: true, value };
-        }
-        default:
-            return { valid: true, value };
-    }
-};
-
-const KNOWN_COUNTRIES = [
-    'India', 'United States', 'USA', 'China', 'Germany', 'United Kingdom', 'UK', 
-    'Japan', 'France', 'Italy', 'Canada', 'Australia', 'Ireland', 'Switzerland', 
-    'Vietnam', 'Thailand', 'Indonesia', 'Malaysia', 'Singapore', 'Taiwan', 
-    'Korea', 'South Korea', 'Sri Lanka', 'Bangladesh', 'Nepal', 'Bhutan', 
-    'United Arab Emirates', 'UAE', 'Spain', 'Netherlands', 'Belgium', 'Brazil', 
-    'Mexico', 'South Africa', 'New Zealand'
-];
-
-/**
- * Universal text sanitization helper to clean OCR noise, broken encodings,
- * mojibake (e.g. "â‚¹", "â€“"), and malformed characters such as "&þ" or isolated "þ".
- * If the resulting string has no real words or characters, returns null so clean
- * human-readable fallbacks ("Not detected") render instead of garbage.
- */
-const sanitizeExtractedText = (val) => {
-    if (val === null || val === undefined) return null;
-    if (typeof val !== 'string') return val;
-
-    let s = val.trim();
-    if (!s) return null;
-
-    // 1. Fix common mojibake sequences from Latin-1 / UTF-8 misdecoding
-    s = s.replace(/â‚¹/g, '₹')
-         .replace(/â€“/g, '—')
-         .replace(/â€”/g, '—')
-         .replace(/â€™/g, "'")
-         .replace(/â€˜/g, "'")
-         .replace(/â€œ/g, '"')
-         .replace(/â€/g, '"')
-         .replace(/Ã©/g, 'é')
-         .replace(/Ã¢/g, 'â')
-         .replace(/Ã¼/g, 'ü');
-
-    // 2. Fix broken thorn / ampersand artifacts ("&þ" -> "&", isolated "þ" -> "")
-    s = s.replace(/&þ/g, '&')
-         .replace(/&amp;þ/g, '&')
-         .replace(/[þðýÿøæœ§±µ¿¡†‡¶°\u00FE\u00FD\u00F0]/g, ' ');
-
-    // 3. Remove non-printable control characters
-    s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '');
-
-    // 4. Collapse multiple spaces
-    s = s.replace(/\s+/g, ' ').trim();
-
-    // 5. If the string is purely junk symbols/punctuation, return null
-    if (/^[\s\-_.:,;/'"&|*~`!@#$%^()=+<>{}[\]\\]+$/.test(s) || s.length === 0) {
-        return null;
-    }
-
-    return s;
-};
-
-/**
- * Generic Spatial Line & Row Reconstruction Layer
+ * Extracts structured evidence from raw OCR results of a single photo.
+ * Normalizes bounding boxes and reconstructs visual rows without premature field interpretation.
  *
- * Reconstructs visual reading rows from bounding boxes using generic 2D geometry:
- * - Sorts elements top-to-bottom and left-to-right
- * - Groups elements belonging to the same visual row based on vertical overlap and height tolerance
- * - Dynamically adapts to varying font sizes (e.g. large numbers next to small units)
- * - Preserves separate visual rows for multi-line text
- * - Preserves two-column layouts and split tokens
- * - Discards zero OCR evidence
- *
- * @param {Array<Object>} rawElements - Array of { index, text, confidence, bbox }
- * @returns {Object} { rows: Array<Object>, orderedElements: Array<Object>, fullText: string }
- */
-const groupIntoRows = (rawElements = []) => {
-    if (!Array.isArray(rawElements) || rawElements.length === 0) {
-        return { rows: [], orderedElements: [], fullText: '' };
-    }
-
-    const parseBBox = (bbox) => {
-        if (!bbox || !Array.isArray(bbox) || bbox.length < 4) return null;
-        let xs, ys;
-        if (Array.isArray(bbox[0]) || (bbox[0] && typeof bbox[0] === 'object')) {
-            xs = bbox.map(p => Array.isArray(p) ? p[0] : (typeof p?.x === 'number' ? p.x : 0));
-            ys = bbox.map(p => Array.isArray(p) ? p[1] : (typeof p?.y === 'number' ? p.y : 0));
-        } else if (bbox.length === 4 && typeof bbox[0] === 'number') {
-            xs = [bbox[0], bbox[2]];
-            ys = [bbox[1], bbox[3]];
-        } else {
-            return null;
-        }
-        const minX = Math.min(...xs);
-        const maxX = Math.max(...xs);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
-        const height = Math.max(1, maxY - minY);
-        const width = Math.max(1, maxX - minX);
-        const centerY = (minY + maxY) / 2;
-        const centerX = (minX + maxX) / 2;
-        return { minX, maxX, minY, maxY, height, width, centerY, centerX };
-    };
-
-    const positioned = [];
-    const unpositioned = [];
-
-    for (const el of rawElements) {
-        const geo = parseBBox(el.bbox || el.boundingBox);
-        if (geo) {
-            positioned.push({
-                ...geo,
-                originalElement: el,
-                text: (el.text || '').trim(),
-                confidence: typeof el.confidence === 'number' ? el.confidence : 0.8,
-                index: el.index
-            });
-        } else {
-            unpositioned.push(el);
-        }
-    }
-
-    // Coarse sort top-to-bottom then left-to-right
-    positioned.sort((a, b) => {
-        if (Math.abs(a.minY - b.minY) > 2) {
-            return a.minY - b.minY;
-        }
-        return a.minX - b.minX;
-    });
-
-    const rows = [];
-
-    for (const elem of positioned) {
-        let bestRow = null;
-        let minCenterDiff = Infinity;
-
-        for (const row of rows) {
-            const verticalOverlap = Math.max(0, Math.min(row.maxY, elem.maxY) - Math.max(row.minY, elem.minY));
-            const minH = Math.min(row.height, elem.height);
-            const maxH = Math.max(row.height, elem.height);
-            const overlapRatio = verticalOverlap / minH;
-            const diffCenterY = Math.abs(elem.centerY - row.centerY);
-
-            // Same visual row if:
-            // 1. Substantial vertical overlap (>= 35% of the shorter element)
-            // 2. OR center of one falls within the bounding vertical span of the other
-            //    and vertical center difference is within 0.55 * maxH (handles large font next to small font)
-            const withinBounds = (elem.centerY >= row.minY && elem.centerY <= row.maxY) ||
-                                 (row.centerY >= elem.minY && row.centerY <= elem.maxY);
-
-            if ((overlapRatio >= 0.35 || (withinBounds && diffCenterY <= maxH * 0.55)) && diffCenterY < maxH * 0.75) {
-                if (diffCenterY < minCenterDiff) {
-                    minCenterDiff = diffCenterY;
-                    bestRow = row;
-                }
-            }
-        }
-
-        if (bestRow) {
-            bestRow.elements.push(elem);
-            bestRow.minY = Math.min(bestRow.minY, elem.minY);
-            bestRow.maxY = Math.max(bestRow.maxY, elem.maxY);
-            bestRow.minX = Math.min(bestRow.minX, elem.minX);
-            bestRow.maxX = Math.max(bestRow.maxX, elem.maxX);
-            bestRow.height = bestRow.maxY - bestRow.minY;
-            bestRow.centerY = bestRow.elements.reduce((sum, e) => sum + e.centerY, 0) / bestRow.elements.length;
-        } else {
-            rows.push({
-                minY: elem.minY,
-                maxY: elem.maxY,
-                minX: elem.minX,
-                maxX: elem.maxX,
-                height: elem.height,
-                centerY: elem.centerY,
-                elements: [elem]
-            });
-        }
-    }
-
-    // Sort rows top-to-bottom by centerY
-    rows.sort((a, b) => a.centerY - b.centerY);
-
-    // Sort elements within each row left-to-right by minX
-    for (const row of rows) {
-        row.elements.sort((a, b) => a.minX - b.minX);
-
-        // Detect columns if large horizontal gap exists between adjacent elements
-        const columns = [];
-        let currentColumn = [];
-        for (let i = 0; i < row.elements.length; i++) {
-            const el = row.elements[i];
-            if (currentColumn.length === 0) {
-                currentColumn.push(el);
-            } else {
-                const prevEl = currentColumn[currentColumn.length - 1];
-                const gap = el.minX - prevEl.maxX;
-                const threshold = Math.max(prevEl.height, el.height) * 2.0;
-                if (gap > threshold) {
-                    columns.push(currentColumn);
-                    currentColumn = [el];
-                } else {
-                    currentColumn.push(el);
-                }
-            }
-        }
-        if (currentColumn.length > 0) {
-            columns.push(currentColumn);
-        }
-        row.columns = columns.map(col => col.map(e => e.originalElement));
-        let rowText = '';
-        for (let i = 0; i < row.elements.length; i++) {
-            const t = (row.elements[i].text || '').trim();
-            if (i === 0) {
-                rowText = t;
-            } else {
-                const prev = (row.elements[i - 1].text || '').trim();
-                if (/[/-]$/.test(prev) || /^[/-]/.test(t)) {
-                    rowText += t;
-                } else {
-                    rowText += ' ' + t;
-                }
-            }
-        }
-        row.text = rowText;
-    }
-
-    const orderedElements = [];
-    for (const row of rows) {
-        for (const el of row.elements) {
-            orderedElements.push(el.originalElement);
-        }
-    }
-    orderedElements.push(...unpositioned);
-
-    const formattedRows = rows.map(r => ({
-        text: r.text,
-        elements: r.elements.map(e => e.originalElement),
-        minY: r.minY,
-        maxY: r.maxY,
-        minX: r.minX,
-        maxX: r.maxX,
-        centerY: r.centerY,
-        height: r.height,
-        columns: r.columns || []
-    }));
-
-    return {
-        rows: formattedRows,
-        orderedElements,
-        fullText: formattedRows.map(r => r.text).join('\n')
-    };
-};
-
-/**
- * Generic Candidate Title Generation (Single-line & Multi-line)
- *
- * Combines visually adjacent rows in the upper display area that share
- * alignment and similar font height into multi-line candidates, while
- * strictly enforcing negative constraints against dates, marketing slogans,
- * instructions, nutrition, addresses, and statutory declarations.
- */
-const generateCandidateTitles = (structuredRows, rawElements) => {
-    const candidates = [];
-    const rows = structuredRows?.rows || [];
-
-    // 1. Single-line candidates from rawElements
-    for (const el of rawElements) {
-        const tr = (el.text || '').trim();
-        if (!tr || isDateShaped(tr) || isMarketingBadge(tr) || isNonProductTitleCandidate(tr)) continue;
-        if (tr.length >= 3 && tr.length <= 60) {
-            candidates.push(el);
-        }
-    }
-
-    // Helper to disqualify rows from multi-line title formation
-    const isDisqualifiedRow = (text) => {
-        if (!text || typeof text !== 'string') return true;
-        const t = text.trim();
-        if (t.length < 2) return true;
-        if (isDateShaped(t) || isMarketingBadge(t) || isNonProductTitleCandidate(t)) return true;
-        // Administrative / statutory prefixes
-        if (/^(?:MRP|M\.?\s*R\.?\s*P\.?|Net\s*(?:Qty|Wt|Weight|Vol|Contents)|Mfg|Mfd|Exp|Best\s*Before|Batch|Lic|FSSAI|Servings?|Ingredients?|Nutritio|Storage|Directions?|Caution|Warning|Marketed|Manufactured|Packed|Imported|Consumer|Customer)\b/i.test(t)) return true;
-        // Instruction keywords
-        if (/\b(?:tear|cut|open|peel|fold|pull|press|push|twist)\b.{0,20}\b(?:here|along|line|tab)/i.test(t)) return true;
-        // Address keywords
-        if (/\b(?:road|street|nagar|plot|industrial|dist|district|pin\s*code|\b\d{6}\b)\b/i.test(t)) return true;
-        // Nutrition declaration line
-        if (/^(?:Total\s*Fat|Protein|Carbohydrates?|Energy|Calories|Sodium|Sugar)\s*[:.-]?\s*\d+/i.test(t)) return true;
-        // Corporate / brand indicator lines should not form multi-line product titles
-        if (/\b(?:foods|organics|labs|pharma|nutrition|mills|beverages|brewing|industries|farms|grains|enterprises|brands|corporation|company|pvt|ltd|inc|llc)\b/i.test(t)) return true;
-        return false;
-    };
-
-    // 2. Multi-line candidates from visually adjacent rows (pairs)
-    const maxImgY = Math.max(...rows.map(r => r.maxY), 1000);
-
-    for (let i = 0; i < rows.length - 1; i++) {
-        const rowA = rows[i];
-        const rowB = rows[i + 1];
-
-        if (isDisqualifiedRow(rowA.text) || isDisqualifiedRow(rowB.text)) continue;
-
-        // Must be in upper 75% of package
-        if (rowA.centerY / maxImgY > 0.75) continue;
-
-        // Vertical gap
-        const verticalGap = rowB.minY - rowA.maxY;
-        const maxH = Math.max(rowA.height, rowB.height);
-        const minH = Math.min(rowA.height, rowB.height);
-
-        // Gap must not be excessive
-        if (verticalGap < -0.25 * maxH || verticalGap > 1.35 * maxH) continue;
-
-        // Font heights must be comparable
-        if (minH / maxH < 0.40) continue;
-
-        // Horizontal relationship: overlap or horizontal proximity
-        const hOverlap = Math.max(0, Math.min(rowA.maxX, rowB.maxX) - Math.max(rowA.minX, rowB.minX));
-        const leftAlignDiff = Math.abs(rowA.minX - rowB.minX);
-        const centerDiff = Math.abs(rowA.centerX - rowB.centerX);
-        const hasHorizontalRelation = hOverlap > 0 || leftAlignDiff < maxH * 2.5 || centerDiff < maxH * 2.5;
-        if (!hasHorizontalRelation) continue;
-
-        const combinedText = `${rowA.text.trim()} ${rowB.text.trim()}`;
-        if (combinedText.length < 5 || combinedText.length > 70) continue;
-        const words = combinedText.split(/\s+/);
-        if (words.length < 2 || words.length > 7) continue;
-
-        if (isNonProductTitleCandidate(combinedText) || isMarketingBadge(combinedText) || isDateShaped(combinedText)) continue;
-
-        const combinedBBox = [
-            [Math.min(rowA.minX, rowB.minX), rowA.minY],
-            [Math.max(rowA.maxX, rowB.maxX), rowA.minY],
-            [Math.max(rowA.maxX, rowB.maxX), rowB.maxY],
-            [Math.min(rowA.minX, rowB.minX), rowB.maxY]
-        ];
-
-        candidates.push({
-            text: combinedText,
-            confidence: Math.min(...rowA.elements.concat(rowB.elements).map(e => e.confidence || 0.8)),
-            bbox: combinedBBox,
-            isMultiLine: true,
-            constituentElements: [...rowA.elements, ...rowB.elements]
-        });
-    }
-
-    return candidates;
-};
-
-/**
- * Extracts structured semantic fields from raw OCR results of a single photo.
- * Preserves evidence provenance (bbox, confidence, source line, rawText).
- *
- * @param {Array|Object} ocrResults - Raw OCR output containing `results` array with `text`, `confidence`, `bbox`.
+ * @param {Array|Object} ocrResults - Raw OCR output containing `results` or `rawElements`.
  * @param {string} sourceImageId - Identifier of the source photo (e.g. "photo-1").
- * @returns {Object} Extracted fields conforming to the canonical data contract.
+ * @returns {Object} Evidence package for downstream multi-angle structuring.
  */
-const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
+const extractFields = (ocrResults, sourceImageId = 'photo-1', options = {}) => {
     let resultsArray = ocrResults;
     if (ocrResults && ocrResults.results) {
         resultsArray = ocrResults.results;
@@ -714,7 +46,6 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         resultsArray = [];
     }
 
-    // Capture source image dimensions for bbox normalization (Issue 4)
     const sourceImageWidth = ocrResults?.imageWidth || 0;
     const sourceImageHeight = ocrResults?.imageHeight || 0;
 
@@ -725,1406 +56,30 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         bbox: r.bbox || r.boundingBox || []
     })).filter(r => Boolean(r.text));
 
-    // Generic spatial reconstruction: group elements into visual rows and sort spatially
+    // Spatial line and row reconstruction
     const structuredRows = groupIntoRows(initialElements);
     const rawElements = structuredRows.orderedElements;
-    const rawTextList = rawElements.map(r => r.text);
-    const fullText = rawTextList.join(' ');
+    const candidateHints = generateCandidateTitles(structuredRows, rawElements);
 
-    // Canonical Declarations Map
-    const declarations = {};
-    const validation = {};
-
-    /**
-     * Phase 5: Enhanced evidence record with provenance tracking
-     * @param {string} source - 'paddleocr_primary', 'spatial_pairing', 'gemini_reconciliation', or 'gemini_fallback'
-     * @param {boolean} aiAssisted - true only for gemini_fallback (requires visible UI label)
-     */
-    const createEvidenceRecord = (value, rawElem, status = 'verified', evidenceList = [], source = 'paddleocr_primary', aiAssisted = false) => {
-        const cleanVal = sanitizeExtractedText(value);
-        return {
-            value: cleanVal,
-            rawText: rawElem ? sanitizeExtractedText(rawElem.text) : null,
-            confidence: rawElem ? rawElem.confidence : 0,
-            sourceImageId,
-            sourceRegion: { bbox: rawElem ? rawElem.bbox : [] },
-            status: cleanVal ? status : 'not_detected',
-            evidence: evidenceList.length > 0 ? evidenceList : (rawElem ? [rawElem.text] : []),
-            source,
-            aiAssisted,
-            reconciledFrom: null
+    // Normalize bounding boxes to 0-1 fractions using photo dimensions (Issue 4)
+    const normalizedRawOcr = rawElements.map(r => {
+        const entry = {
+            text: (r.text || '').trim(),
+            confidence: typeof r.confidence === 'number' ? r.confidence : 0.8,
+            bbox: r.bbox || r.boundingBox || []
         };
-    };
-
-    // =================================================================
-    // Phase 5 Fix 3: Spatial (Bounding-Box) Label-Value Pairing
-    // Uses physical position of detected text to pair labels with values
-    // =================================================================
-    const spatialLabelValuePairing = (rawElements) => {
-        const spatialResults = {};
-        
-        // Known label keywords and the fields they map to
-        const LABEL_PATTERNS = [
-            { pattern: /^(?:USP|Unit\s*Sale\s*Price)$/i, field: 'unitSalePrice', valueType: 'price' },
-            { pattern: /^(?:MRP|M\.?\s*R\.?\s*P\.?|Max\.?\s*Retail\s*Price)$/i, field: 'mrp', valueType: 'price' },
-            { pattern: /^(?:Net\s*(?:Qty|Quantity|Weight|Wt|Vol|Contents)\.?)$/i, field: 'netQuantity', valueType: 'quantity' },
-            { pattern: /^(?:Manufactured\s*By|Mfd\.?\s*By)$/i, field: 'manufacturer.name', valueType: 'text' },
-            { pattern: /^(?:Marketed\s*By)$/i, field: 'marketer.name', valueType: 'text' },
-            { pattern: /^(?:Packed\s*By|Pkd\.?\s*By)$/i, field: 'packer.name', valueType: 'text' },
-            { pattern: /^(?:Imported\s*By)$/i, field: 'importer.name', valueType: 'text' },
-            { pattern: /^(?:Country\s*of\s*Origin|Made\s*in)$/i, field: 'countryOfOrigin', valueType: 'text' },
-            { pattern: /^(?:Consumer\s*Care|Customer\s*Care|For\s*Feedback|Helpline)$/i, field: 'consumerCare', valueType: 'text' },
-        ];
-
-        // Helper: get center point of a bbox
-        const bboxCenter = (bbox) => {
-            if (!bbox || bbox.length < 4) return null;
-            const cx = bbox.reduce((s, p) => s + p[0], 0) / bbox.length;
-            const cy = bbox.reduce((s, p) => s + p[1], 0) / bbox.length;
-            return { x: cx, y: cy };
-        };
-
-        // Helper: get bbox height
-        const bboxHeight = (bbox) => {
-            if (!bbox || bbox.length < 4) return 30; // default
-            const ys = bbox.map(p => p[1]);
-            return Math.max(...ys) - Math.min(...ys);
-        };
-
-        // For each label pattern, find matching label elements
-        for (const { pattern, field, valueType } of LABEL_PATTERNS) {
-            for (const el of rawElements) {
-                if (!pattern.test(el.text.trim())) continue;
-                
-                const labelCenter = bboxCenter(el.bbox);
-                if (!labelCenter) continue;
-                const lineHeight = bboxHeight(el.bbox);
-                const maxVerticalDist = lineHeight * 2.5;
-                const maxHorizontalDist = lineHeight * 15;
-
-                // Find value candidates: elements to the right or below the label
-                let bestCandidate = null;
-                let bestDist = Infinity;
-
-                for (const candidate of rawElements) {
-                    if (candidate.index === el.index) continue;
-                    const candCenter = bboxCenter(candidate.bbox);
-                    if (!candCenter) continue;
-
-                    // Filter by value type
-                    const candText = candidate.text.trim();
-                    if (valueType === 'price') {
-                        if (!/\d+(?:\.\d+)?/.test(candText)) continue;
-                        if (isDateShaped(candText) || /\d{1,2}:\d{2}/.test(candText) || /^[+\d\s\-().]{7,25}$/.test(candText)) continue;
-                    }
-                    if (valueType === 'quantity') {
-                        if (!/\d/.test(candText) || isDateShaped(candText)) continue;
-                    }
-
-                    // Check spatial proximity: to the right (same line) or directly below
-                    const dx = candCenter.x - labelCenter.x;
-                    const dy = candCenter.y - labelCenter.y;
-
-                    // Right-of-label (same line): small vertical diff, positive horizontal
-                    const isSameLine = Math.abs(dy) < maxVerticalDist && dx > 0 && dx < maxHorizontalDist;
-                    // Below-label: positive vertical, small horizontal diff
-                    const isBelow = dy > 0 && dy < maxVerticalDist * 2 && Math.abs(dx) < maxHorizontalDist * 0.5;
-
-                    if (isSameLine || isBelow) {
-                        const dist = Math.sqrt(dx * dx + dy * dy);
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            bestCandidate = candidate;
-                        }
-                    }
-                }
-
-                if (bestCandidate) {
-                    spatialResults[field] = {
-                        value: bestCandidate.text.trim(),
-                        confidence: bestCandidate.confidence,
-                        labelElement: el,
-                        valueElement: bestCandidate,
-                        source: 'spatial_pairing'
-                    };
-                }
-                break; // Use first matching label for this field
-            }
+        if (sourceImageWidth > 0 && sourceImageHeight > 0 && Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
+            entry.bbox = entry.bbox.map(pt => [
+                pt[0] / sourceImageWidth,
+                pt[1] / sourceImageHeight
+            ]);
+        } else if (Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
+            entry.bbox = [];
         }
+        return entry;
+    }).filter(r => Boolean(r.text));
 
-        return spatialResults;
-    };
-
-    // Run spatial pairing (used later as fallback for undetected fields)
-    const spatialPairs = spatialLabelValuePairing(rawElements);
-
-    // -------------------------------------------------------------
-    // 1. Country of Origin
-    // -------------------------------------------------------------
-    let countryVal = null;
-    let countryElem = null;
-    const cooPrefixRegex = /(?:Country of Origin|Made in|Product of)\s*[:.-]?\s*([a-zA-Z\s]{2,30})/i;
-    const cooMatch = fullText.match(cooPrefixRegex);
-    if (cooMatch) {
-        const candidate = cooMatch[1].trim();
-        for (const country of KNOWN_COUNTRIES) {
-            if (new RegExp(`\\b${country}\\b`, 'i').test(candidate)) {
-                // Disallow candidate if it contains digits or FSSAI/Lic
-                if (!/\d|fssai|lic/i.test(candidate)) {
-                    countryVal = country === 'USA' ? 'United States' : country;
-                    countryElem = rawElements.find(r => cooPrefixRegex.test(r.text)) || null;
-                    break;
-                }
-            }
-        }
-    }
-    if (!countryVal) {
-        for (const el of rawElements) {
-            if (/origin|made in|product of/i.test(el.text)) {
-                for (const country of KNOWN_COUNTRIES) {
-                    if (new RegExp(`\\b${country}\\b`, 'i').test(el.text) && !/\d|fssai|lic/i.test(el.text)) {
-                        countryVal = country === 'USA' ? 'United States' : country;
-                        countryElem = el;
-                        break;
-                    }
-                }
-            }
-            if (countryVal) break;
-        }
-    }
-    declarations.countryOfOrigin = createEvidenceRecord(
-        countryVal, 
-        countryElem, 
-        countryVal ? 'verified' : 'not_detected'
-    );
-    validation.countryOfOrigin = {
-        status: countryVal ? 'verified' : 'not_detected',
-        reason: countryVal ? `Verified country: ${countryVal}` : 'No valid country of origin declaration observed'
-    };
-
-    // -------------------------------------------------------------
-    // 2. FSSAI License Number (Strict 14-Digit Format)
-    // -------------------------------------------------------------
-    let fssaiVal = null;
-    let fssaiElem = null;
-    const fssaiAll = []; // Capture ALL 14-digit FSSAI numbers
-    const fssaiRegex = /(?:FSSAI|Lic(?:ense)?(?:\s*No)?\.?)\s*[:.-]?\s*([0-9]{14})\b/i;
-    for (const el of rawElements) {
-        const m = el.text.match(fssaiRegex);
-        if (m) {
-            if (!fssaiAll.includes(m[1])) fssaiAll.push(m[1]);
-            if (!fssaiVal) { fssaiVal = m[1]; fssaiElem = el; }
-        }
-    }
-    // Also search for standalone 14-digit numbers starting with 1 or 2
-    for (const el of rawElements) {
-        const standalone14 = el.text.match(/\b([12]\d{13})\b/g);
-        if (standalone14) {
-            for (const num of standalone14) {
-                if (!fssaiAll.includes(num)) fssaiAll.push(num);
-                if (!fssaiVal) { fssaiVal = num; fssaiElem = el; }
-            }
-        }
-    }
-    declarations.fssaiLicense = createEvidenceRecord(
-        fssaiVal,
-        fssaiElem,
-        fssaiVal ? 'verified' : 'not_detected'
-    );
-    declarations.fssaiLicenses = fssaiAll; // All found FSSAI numbers
-    validation.fssaiLicense = {
-        status: fssaiVal ? 'verified' : 'not_detected',
-        reason: fssaiAll.length > 1 
-            ? `Found ${fssaiAll.length} FSSAI license numbers: ${fssaiAll.join(', ')}`
-            : (fssaiVal ? `Valid 14-digit FSSAI license: ${fssaiVal}` : 'No 14-digit FSSAI license detected')
-    };
-
-    // -------------------------------------------------------------
-    // 3. Batch / Lot Number
-    // -------------------------------------------------------------
-    const BATCH_RESERVED = /^(date|mfg|exp|batch|pkd|mrp|usp|price|lic|tablets|capsules|values|kcal|approx)$/i;
-    let batchVal = null;
-    let batchElem = null;
-    for (const el of rawElements) {
-        const line = el.text.trim();
-        if (/^[A-Z]{2,6}\d{4,10}$/i.test(line)) {
-            if (!/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2,4}$/i.test(line)) {
-                batchVal = line;
-                batchElem = el;
-                break;
-            }
-        }
-    }
-    if (!batchVal) {
-    const batchRegex = /(?:Batch|Lot|B\.?\s*No\.?|Batch\s*No\.?)\s*[:.-]?\s*([A-Za-z0-9/-]{3,20})/i;
-    for (let i = 0; i < rawElements.length; i++) {
-        const el = rawElements[i];
-        const m = el.text.match(batchRegex);
-        if (m && m[1] && !/all|taxes|mrp|exp|mfg/i.test(m[1])) {
-            batchVal = m[1].trim();
-            batchElem = el;
-            break;
-        }
-        // Standalone label with value in subsequent elements
-        if (/^(?:Batch|Lot|B\.?\s*No\.?|Batch\s*No\.?)$/i.test(el.text.trim())) {
-            for (let j = 1; j <= 5 && i + j < rawElements.length; j++) {
-                const cand = rawElements[i + j].text.trim();
-                if (/^[A-Za-z0-9]{4,15}$/.test(cand) && !/^(?:MRP|USP|RS|ALL|TAX|DATE|NOV|MAY|EXP|MFG)$/i.test(cand) && !/^\d+$/.test(cand)) {
-                    batchVal = cand;
-                    batchElem = rawElements[i + j];
-                    break;
-                }
-            }
-            if (batchVal) break;
-        }
-    }
-    }
-    declarations.batchNumber = createEvidenceRecord(batchVal, batchElem, batchVal ? 'verified' : 'not_detected');
-    validation.batchNumber = {
-        status: batchVal ? 'verified' : 'not_detected',
-        reason: batchVal ? `Batch / Lot: ${batchVal}` : 'Batch or lot number not detected'
-    };
-
-    // -------------------------------------------------------------
-    // 4. Dates: Manufacture, Expiry & Best Before
-    // -------------------------------------------------------------
-    const MONTH_PATTERN = '(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)';
-    const textDateRegex = new RegExp(`(${MONTH_PATTERN})[\\s./-]*(\\d{4}|\\d{2})`, 'i');
-    const fullDateRegex = /\b(0?[1-9]|[12]\d|3[01])[-/](0?[1-9]|1[012])[-/](20\d\d)\b/;
-    const monthYearSlashRegex = /\b(0?[1-9]|1[012])[/](20\d\d)\b/;
-
-    const detectedDateElements = [];
-    rawElements.forEach(el => {
-        if (/[+]|kcal|usp|per|mrp|ins\s*\d|servings/i.test(el.text)) return;
-        const tm = el.text.match(textDateRegex);
-        if (tm) {
-            const normalizedDateStr = `${tm[1].toUpperCase()} ${tm[2]}`;
-            detectedDateElements.push({ dateStr: normalizedDateStr, elem: el });
-        }
-        const dm = el.text.match(fullDateRegex);
-        if (dm) detectedDateElements.push({ dateStr: dm[0], elem: el });
-        const my = el.text.match(monthYearSlashRegex);
-        if (my && !dm) detectedDateElements.push({ dateStr: my[0], elem: el });
-    });
-
-    // Phase 5: Pair isolated month tokens (e.g. "NOV") with nearby isolated year tokens (e.g. "2027")
-    const isolatedMonthRegex = new RegExp(`^(?:(?:EXP|EXPIRY|USE\\s*BY|MFG|PKD|PACKED)[.:\\s]*)?(${MONTH_PATTERN})[\\s./-]*$`, 'i');
-    const isolatedYearRegex = /^(?:20\d{2}|2[0-9]|3[0-5])$/;
-
-    rawElements.forEach((el, idx) => {
-        if (/[+]|kcal|usp|per|mrp|ins\s*\d|servings/i.test(el.text)) return;
-        const monthMatch = el.text.match(isolatedMonthRegex);
-        if (monthMatch) {
-            const alreadyRegistered = detectedDateElements.some(d => d.elem === el);
-            if (!alreadyRegistered) {
-                // Look ahead up to 5 elements and behind up to 2 elements for an isolated year
-                const searchIndices = [];
-                for (let j = 1; j <= 5; j++) {
-                    if (idx + j < rawElements.length) searchIndices.push(idx + j);
-                }
-                for (let j = 1; j <= 2; j++) {
-                    if (idx - j >= 0) searchIndices.push(idx - j);
-                }
-                for (const targetIdx of searchIndices) {
-                    const targetEl = rawElements[targetIdx];
-                    if (targetEl && isolatedYearRegex.test(targetEl.text.trim())) {
-                        const yearStr = targetEl.text.trim();
-                        const normalizedDateStr = `${monthMatch[1].toUpperCase()} ${yearStr}`;
-                        detectedDateElements.push({ dateStr: normalizedDateStr, elem: el, secondaryElem: targetEl });
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let mfgVal = null;
-    let mfgElem = null;
-    let expVal = null;
-    let expElem = null;
-    let bbVal = null;
-    let bbElem = null;
-
-    // Explicit prefix matches
-    const mfgRegex = /(?:MFG|Mfg Date|Pkd|Packed|Date of Mfg|Manufactured)[.\s:]*([A-Za-z0-9/.-]+)/i;
-    const expRegex = /(?:EXP|Expiry|Use by|Exp Date)[.\s:]*([A-Za-z0-9/.-]+)/i;
-    const bbRegex = /(?:Best Before)[.\s:]*([\w\s]+)/i;
-
-    rawElements.forEach(el => {
-        const mm = el.text.match(mfgRegex);
-        if (mm && /\d/.test(mm[1]) && !/all|taxes|mrp|exp|batch|capsule/i.test(mm[1])) {
-            const raw = mm[1].trim();
-            const tm = raw.match(textDateRegex);
-            mfgVal = tm ? `${tm[1].toUpperCase()} ${tm[2]}` : raw;
-            mfgElem = el;
-        }
-        const em = el.text.match(expRegex);
-        if (em && /\d/.test(em[1]) && !/all|taxes|mrp|mfg|batch|capsule/i.test(em[1])) {
-            const raw = em[1].trim();
-            const tm = raw.match(textDateRegex);
-            expVal = tm ? `${tm[1].toUpperCase()} ${tm[2]}` : raw;
-            expElem = el;
-        }
-        const bm = el.text.match(bbRegex);
-        if (bm && bm[1].trim().length > 2) {
-            bbVal = bm[1].trim();
-            bbElem = el;
-        }
-    });
-
-    // Chronological date resolution if prefixes were separated across lines
-    if (detectedDateElements.length >= 2 && (!mfgVal || !expVal)) {
-        const mfgFound = detectedDateElements.find(d => /mfg|pkd|manufactured|date/i.test(d.elem.text) && !/exp|use by/i.test(d.elem.text));
-        const expFound = detectedDateElements.find(d => /exp|use by/i.test(d.elem.text));
-        if (mfgFound && !mfgVal) { mfgVal = mfgFound.dateStr; mfgElem = mfgFound.elem; }
-        if (expFound && !expVal) { expVal = expFound.dateStr; expElem = expFound.elem; }
-
-        if (!mfgVal || !expVal) {
-            const monthsMap = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
-            const getTimestamp = (dStr) => {
-                const tm = dStr.match(/([A-Z]{3})\s*(\d{4})/i);
-                if (tm) return new Date(parseInt(tm[2]), monthsMap[tm[1].toUpperCase()] || 0, 1).getTime();
-                const num = dStr.match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
-                if (num) return new Date(parseInt(num[3]), parseInt(num[2]) - 1, parseInt(num[1])).getTime();
-                const my = dStr.match(/(\d{1,2})[/](\d{4})/);
-                if (my) return new Date(parseInt(my[2]), parseInt(my[1]) - 1, 1).getTime();
-                return 0;
-            };
-
-            const sorted = [...detectedDateElements].sort((a, b) => getTimestamp(a.dateStr) - getTimestamp(b.dateStr));
-            if (!mfgVal) { mfgVal = sorted[0].dateStr; mfgElem = sorted[0].elem; }
-            if (!expVal && sorted.length > 1) { expVal = sorted[sorted.length - 1].dateStr; expElem = sorted[sorted.length - 1].elem; }
-        }
-    } else if (detectedDateElements.length === 1 && !mfgVal && !expVal) {
-        if (/exp|use by/i.test(detectedDateElements[0].elem.text)) {
-            expVal = detectedDateElements[0].dateStr;
-            expElem = detectedDateElements[0].elem;
-        } else {
-            mfgVal = detectedDateElements[0].dateStr;
-            mfgElem = detectedDateElements[0].elem;
-        }
-    }
-
-    // Check reconstructed structuredRows for date patterns if individual elements were fragmented across a visual row
-    if (structuredRows && Array.isArray(structuredRows.rows)) {
-        structuredRows.rows.forEach(r => {
-            const rowCleanText = r.text
-                .replace(/([0-9]{1,2}[/-])\s+([0-9]{1,4})/g, '$1$2')
-                .replace(/([/-])\s+([0-9]{2,4})/g, '$1$2');
-            if (!mfgVal) {
-                const mm = rowCleanText.match(mfgRegex);
-                if (mm && /\d/.test(mm[1]) && !/all|taxes|mrp|exp|batch|capsule/i.test(mm[1])) {
-                    const raw = mm[1].trim();
-                    const tm = raw.match(textDateRegex);
-                    mfgVal = tm ? `${tm[1].toUpperCase()} ${tm[2]}` : raw;
-                    mfgElem = r.elements[0];
-                }
-            }
-            if (!expVal) {
-                const em = rowCleanText.match(expRegex);
-                if (em && /\d/.test(em[1]) && !/all|taxes|mrp|mfg|batch|capsule/i.test(em[1])) {
-                    const raw = em[1].trim();
-                    const tm = raw.match(textDateRegex);
-                    expVal = tm ? `${tm[1].toUpperCase()} ${tm[2]}` : raw;
-                    expElem = r.elements[0];
-                }
-            }
-            if (!bbVal) {
-                const bm = rowCleanText.match(bbRegex);
-                if (bm && bm[1].trim().length > 2) {
-                    bbVal = bm[1].trim();
-                    bbElem = r.elements[0];
-                }
-            }
-        });
-    }
-
-    declarations.manufacturingDate = createEvidenceRecord(mfgVal, mfgElem, mfgVal ? 'verified' : 'not_detected');
-    declarations.expiryDate = createEvidenceRecord(expVal, expElem, expVal ? 'verified' : 'not_detected');
-    declarations.bestBefore = createEvidenceRecord(bbVal, bbElem, bbVal ? 'verified' : 'not_detected');
-
-    validation.manufacturingDate = {
-        status: mfgVal ? 'verified' : 'not_detected',
-        reason: mfgVal ? `Manufacturing / Packaging Date: ${mfgVal}` : 'No manufacturing date detected'
-    };
-    validation.expiryDate = {
-        status: expVal ? 'verified' : 'not_detected',
-        reason: expVal ? `Expiry / Use-by Date: ${expVal}` : 'No expiry date detected'
-    };
-
-    // -------------------------------------------------------------
-    // 5. Unit Sale Price (USP)
-    // -------------------------------------------------------------
-    let uspVal = null;
-    let uspElem = null;
-    let uspSource = 'paddleocr_primary';
-    const uspRegex = /(?:USP|Unit\s*Sale\s*Price|Rs\.?\s*per)\s*[:.-]?\s*(?:Rs\.?|₹)?\s*(\d+(?:\.\d+)?)\s*(?:\/|\s*per\s*)?\s*([a-zA-Z.]+)?/i;
-    for (const el of rawElements) {
-        const um = el.text.match(uspRegex);
-        if (um) {
-            const price = um[1];
-            const unit = (um[2] || 'unit').replace(/[^a-zA-Z]/g, '');
-            uspVal = `Rs. ${price} / ${unit || 'Cap.'}`;
-            uspElem = el;
-            break;
-        }
-    }
-    // Bug 6 fix: Also search for per-unit price pattern (e.g. "Rs 7.66/g", "₹7.66/g", "7.66 per g")
-    if (!uspVal) {
-        const perUnitRegex = /(?:Rs\.?|₹)\s*(\d+(?:\.\d+)?)\s*\/\s*(g|kg|ml|l|unit|cap|tab|piece|pc|sachet)/i;
-        for (const el of rawElements) {
-            // Skip if this element is also the MRP element or contains MRP-like context
-            if (/MRP|Max\s*Retail/i.test(el.text)) continue;
-            const pum = el.text.match(perUnitRegex);
-            if (pum) {
-                uspVal = `Rs. ${pum[1]} / ${pum[2]}`;
-                uspElem = el;
-                break;
-            }
-        }
-    }
-    // Phase 5 Fix 3: Spatial pairing fallback for USP
-    if (!uspVal && spatialPairs['unitSalePrice']) {
-        const sp = spatialPairs['unitSalePrice'];
-        const priceMatch = sp.value.match(/(\d+(?:\.\d+)?)/); 
-        if (priceMatch) {
-            uspVal = `Rs. ${priceMatch[1]} / unit`;
-            uspElem = sp.valueElement;
-            uspSource = 'spatial_pairing';
-            console.log(`[Extraction] USP recovered via spatial pairing: ${uspVal}`);
-        }
-    }
-    declarations.unitSalePrice = createEvidenceRecord(uspVal, uspElem, uspVal ? 'verified' : 'not_detected', [], uspSource);
-    validation.unitSalePrice = {
-        status: uspVal ? 'verified' : 'not_detected',
-        reason: uspVal ? `Declared USP: ${uspVal}` : 'Unit sale price not declared'
-    };
-
-    // -------------------------------------------------------------
-    // 6. MRP & Taxes
-    // -------------------------------------------------------------
-    let mrpVal = null;
-    let mrpElem = null;
-    let mrpSource = 'paddleocr_primary';
-    let inclTaxes = null;
-
-    // Bug 6 fix: Broader MRP regex to handle M.R.P., M R P, MRP. etc
-    const mrpRegex = /(?:M\.?\s*R\.?\s*P\.?|MRP|Price|Max\.?\s*Retail\s*Price)\s*[:.-]?\s*(?:Rs\.?|₹)?\s*(\d+(?:\.\d+)?)/i;
-    for (const el of rawElements) {
-        const mm = el.text.match(mrpRegex);
-        if (mm) {
-            const num = parseFloat(mm[1]);
-            if (!isNaN(num) && num > 0 && num < 500000) {
-                mrpVal = num;
-                mrpElem = el;
-                break;
-            }
-        }
-    }
-    // Bug 6 fix: Adjacent-element search when "MRP" label has no price on same line
-    if (!mrpVal) {
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            if (/^(?:M\.?\s*R\.?\s*P\.?|MRP)\s*[:.-]?\s*$/i.test(el.text.trim())) {
-                // Look at next 5 elements for a price value, skipping dates, USP, and phone numbers
-                for (let j = 1; j <= 5 && i + j < rawElements.length; j++) {
-                    const candText = rawElements[i + j].text.trim();
-                    if (isDateShaped(candText) || /usp|cap|unit\s*sale/i.test(candText) || /^[+\d\s\-().]{7,25}$/.test(candText)) continue;
-                    const priceMatch = candText.match(/(?:Rs\.?|₹)?\s*(\d{2,6}(?:\.\d{2})?)/);
-                    if (priceMatch) {
-                        const num = parseFloat(priceMatch[1]);
-                        if (!isNaN(num) && num > 10 && num < 500000) {
-                            mrpVal = num;
-                            mrpElem = rawElements[i + j];
-                            break;
-                        }
-                    }
-                }
-                if (mrpVal) break;
-            }
-        }
-    }
-    // Standalone price fallback
-    if (!mrpVal) {
-        for (const el of rawElements) {
-            const pm = el.text.match(/^(\d{2,5}\.\d{2})$/);
-            if (pm) {
-                const num = parseFloat(pm[1]);
-                if (num > 20) {
-                    mrpVal = num;
-                    mrpElem = el;
-                    break;
-                }
-            }
-        }
-    }
-    // Bug 6 fix: Spatial pairing fallback for MRP
-    if (!mrpVal && spatialPairs['mrp']) {
-        const sp = spatialPairs['mrp'];
-        const priceMatch = sp.value.match(/(\d+(?:\.\d+)?)/);
-        if (priceMatch) {
-            const num = parseFloat(priceMatch[1]);
-            if (!isNaN(num) && num > 10 && num < 500000) {
-                mrpVal = num;
-                mrpElem = sp.valueElement;
-                mrpSource = 'spatial_pairing';
-                console.log(`[Extraction] MRP recovered via spatial pairing: ${mrpVal}`);
-            }
-        }
-    }
-    if (/inclusive of all taxes|incl\.?\s*of\s*all\s*taxes|incl\.?\s*of\s*taxes|Iincl of/i.test(fullText)) {
-        inclTaxes = true;
-    }
-    declarations.mrp = {
-        value: mrpVal,
-        currency: 'INR',
-        inclusiveOfTaxes: inclTaxes,
-        rawText: mrpElem ? mrpElem.text : null,
-        confidence: mrpElem ? mrpElem.confidence : 0,
-        sourceImageId,
-        sourceRegion: { bbox: mrpElem ? mrpElem.bbox : [] },
-        status: mrpVal ? 'verified' : 'not_detected',
-        evidence: mrpElem ? [mrpElem.text] : []
-    };
-    validation.mrp = {
-        status: mrpVal ? 'verified' : 'not_detected',
-        reason: mrpVal ? `MRP ₹${mrpVal}${inclTaxes ? ' (Inclusive of all taxes)' : ''}` : 'MRP not detected'
-    };
-
-    // -------------------------------------------------------------
-    // 7. Servings vs Net Quantity (STRICT MANDATORY SEPARATION)
-    // -------------------------------------------------------------
-    let servingsPerContainer = null;
-    let servingsElem = null;
-    // Match "Servings Per Container: N" or "Approx N Servings" or "N Servings" (standalone)
-    const servingsMatch = fullText.match(/(?:Servings\s*Per\s*Container)\s*[:.-]?\s*(\d+)/i);
-    if (servingsMatch) {
-        servingsPerContainer = parseInt(servingsMatch[1], 10);
-        servingsElem = rawElements.find(r => /Servings\s*Per\s*Container/i.test(r.text)) || null;
-    }
-    // Bug 4 fix: Also capture standalone "N Servings" (e.g. "100 Servings" on front label)
-    if (!servingsPerContainer) {
-        // Strip out net weight declarations first to avoid "Net wt. 300 Servings" stream collision
-        const cleanServingsText = fullText.replace(/(?:net\s*wt\.?|net\s*weight|net\s*quantity)\s*[:.-]?\s*\d+/gi, ' ');
-        const standaloneServings = cleanServingsText.match(/\b(\d+)\s*Servings?\b/i);
-        if (standaloneServings) {
-            servingsPerContainer = parseInt(standaloneServings[1], 10);
-            servingsElem = rawElements.find(r => /\d+\s*Servings?\b/i.test(r.text)) || null;
-        }
-    }
-    declarations.servingsPerContainer = createEvidenceRecord(
-        servingsPerContainer, 
-        servingsElem, 
-        servingsPerContainer ? 'verified' : 'not_detected'
-    );
-
-    let servingSize = null;
-    let servingSizeElem = null;
-    const sizeMatch = fullText.match(/(?:Serving\s*Size)\s*[:.-]?\s*([^\n\r,]+)/i);
-    if (sizeMatch) {
-        let rawSize = sizeMatch[1].trim();
-        // Bug 3 fix: Truncate at field boundaries — stop before nutrition table, how-to-use, storage, etc.
-        const truncateAt = rawSize.search(/\b(?:Energy|Protein|Fat|Carbohydrate|Sugar|Sodium|Fiber|Calories|kcal|How\s*to|Directions|Storage|Store|Keep\s*in|Nutrition|Amount\s*Per|Daily\s*Value|\d+(?:\.\d+)?\s*(?:kcal|mg|mcg))\b/i);
-        if (truncateAt > 0) {
-            rawSize = rawSize.substring(0, truncateAt).trim();
-        }
-        // Bug 3 fix: Max length safety guard — serving sizes are typically very short
-        if (rawSize.length > 40) {
-            // Extract just the quantity portion (e.g., "3 g" or "one scoop (3g)")
-            const shortMatch = rawSize.match(/^(.{0,40}?)(?:\s+\w{3,}|\s*$)/);
-            if (shortMatch) rawSize = shortMatch[1].trim();
-            if (rawSize.length > 40) rawSize = rawSize.substring(0, 40).trim();
-        }
-        // Remove trailing punctuation artifacts
-        rawSize = rawSize.replace(/[:\-|]+\s*$/, '').trim();
-        if (rawSize.length >= 2) {
-            servingSize = rawSize;
-        }
-        servingSizeElem = rawElements.find(r => /Serving\s*Size/i.test(r.text)) || null;
-    }
-    declarations.servingSize = createEvidenceRecord(
-        servingSize, 
-        servingSizeElem, 
-        servingSize ? 'verified' : 'not_detected'
-    );
-
-    // Explicit Net Quantity: MUST NOT be inferred from Servings Per Container!
-    let netQtyVal = null;
-    let netQtyUnit = null;
-    let netQtyElem = null;
-
-    // Pattern A: Explicit "Net Qty / Net Weight / Net Wt: X unit" (from structuredRows or rawElements)
-    const explicitQtyRegex = /(?:Net\s*(?:Qty|Quantity|Weight|Wt|Vol|Contents)?\.?\s*[:.-]?\s*)(\d+(?:\.\d+)?)(?:\s*(ml|g|kg|l|liter|litre|mg))?\b/i;
-    const qtySearchItems = (structuredRows?.rows && structuredRows.rows.length > 0)
-        ? structuredRows.rows.map(r => ({ text: r.text, elem: r.elements[0] })).concat(rawElements.map(e => ({ text: e.text, elem: e })))
-        : rawElements.map(e => ({ text: e.text, elem: e }));
-
-    for (const item of qtySearchItems) {
-        // Skip nutrition table elements
-        if (/per\s*serving|amount\s*per|nutrition/i.test(item.text)) continue;
-        const eqm = item.text.match(explicitQtyRegex);
-        if (eqm) {
-            const valCandidate = parseFloat(eqm[1]);
-            // Only accept if preceded by Net or Wt or Weight
-            if (/(?:Net|Weight|Wt|Contents)/i.test(item.text)) {
-                netQtyVal = valCandidate;
-                netQtyUnit = (eqm[2] || 'g').toLowerCase();
-                netQtyElem = item.elem;
-                break;
-            }
-        }
-    }
-
-    // Pattern B: Count of commodity (e.g. "60 Capsules", "60 Tablets", "60 Softgels")
-    if (!netQtyVal) {
-        const commodityCountRegex = /\b(\d+)\s*(Capsules|Tablets|Softgels|Cap|Pcs|Units)\b/i;
-        for (const el of rawElements) {
-            // Must not be in nutrition panel or ingredients list
-            if (/per serving|daily|value|protein|carbohydrate|fat|ins\s*\d/i.test(el.text)) continue;
-            const ccm = el.text.match(commodityCountRegex);
-            if (ccm) {
-                netQtyVal = parseInt(ccm[1], 10);
-                netQtyUnit = ccm[2].toLowerCase();
-                netQtyElem = el;
-                break;
-            }
-        }
-    }
-
-    // Pattern C: Prominent standalone weight/volume (e.g., "500 g", "1 kg") if >= 5
-    if (!netQtyVal) {
-        const standaloneWeightRegex = /^(\d+(?:\.\d+)?)\s*(g|kg|ml|l)\b/i;
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            // Reject if this or adjacent elements indicate nutrition facts table
-            const nearbyText = rawElements.slice(Math.max(0, i - 2), i + 3).map(r => r.text).join(' ');
-            if (/protein|fat|sugar|sodium|carb|per\s*100|amount\s*per|nutrition|typical\s*values/i.test(nearbyText)) continue;
-            
-            const swm = el.text.match(standaloneWeightRegex);
-            if (swm) {
-                const num = parseFloat(swm[1]);
-                if (num >= 5) {
-                    // Bug 4 fix: Reject if value matches servingsPerContainer AND nearby text says "Servings"
-                    if (servingsPerContainer !== null && num === servingsPerContainer) {
-                        if (/serving/i.test(nearbyText)) {
-                            console.log(`[Extraction] Bug4 guard: Rejected ${num} ${swm[2]} as net quantity — matches servingsPerContainer and "Servings" is nearby`);
-                            continue;
-                        }
-                    }
-                    netQtyVal = num;
-                    netQtyUnit = swm[2].toLowerCase();
-                    netQtyElem = el;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Pattern D: Embedded standard metric weight/volume in multi-declaration lines (e.g. "20 FL OZ (1.25 PT) 591 mL")
-    if (!netQtyVal) {
-        const embeddedMetricRegex = /\b(\d+(?:\.\d+)?)\s*(ml|mls|g|gm|gms|kg|kgs|l|lt|ltr)\b/i;
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            if (/per\s*serving|amount\s*per|nutrition|sodium|protein|fat|carb|energy|kcal|sugars?|cholesterol/i.test(el.text)) continue;
-            const emm = el.text.match(embeddedMetricRegex);
-            if (emm) {
-                const num = parseFloat(emm[1]);
-                if (num >= 5) {
-                    netQtyVal = num;
-                    netQtyUnit = emm[2].toLowerCase();
-                    netQtyElem = el;
-                    break;
-                }
-            }
-        }
-    }
-
-    const isUnitValid = netQtyVal !== null && isValidQuantityUnit(netQtyUnit);
-    declarations.netQuantity = {
-        value: netQtyVal,
-        unit: netQtyUnit,
-        rawText: netQtyElem ? netQtyElem.text : null,
-        confidence: isUnitValid ? (netQtyElem ? netQtyElem.confidence : 0) : 0.3,
-        sourceImageId,
-        sourceRegion: { bbox: netQtyElem ? netQtyElem.bbox : [] },
-        status: isUnitValid ? 'verified' : (netQtyVal ? 'unverified' : 'not_detected'),
-        needsReview: !isUnitValid && netQtyVal !== null,
-        evidence: netQtyElem ? [netQtyElem.text] : []
-    };
-    validation.netQuantity = {
-        status: isUnitValid ? 'verified' : (netQtyVal ? 'unverified' : 'not_detected'),
-        reason: isUnitValid 
-            ? `Declared Net Quantity: ${netQtyVal} ${netQtyUnit}` 
-            : (netQtyVal ? `Net quantity unit "${netQtyUnit}" is not a recognized metric or count unit` : 'Net quantity declaration not detected')
-    };
-
-    // -------------------------------------------------------------
-    // 8. Manufacturer, Packer, Importer, Marketer Separation
-    // -------------------------------------------------------------
-    let mfrName = null;
-    let mfrElem = null;
-    let pkrName = null;
-    let impName = null;
-    let mktName = null;
-
-    const PARTY_STOP = '(?=(?:Regd|Lic|Customer|Net|MRP|FSSAI|Marketed|Packed|Manufactured|Imported|$))';
-    const mfrRegex = new RegExp(`(?:Manufactured\\s*(?:By|at)|Mfd\\.?\\s*By)\\s*[:.-]?\\s*([\\w\\s,.-]+?)${PARTY_STOP}`, 'i');
-    const pkrRegex = new RegExp(`(?:Packed\\s*By|Pkd\\.?\\s*By)\\s*[:.-]?\\s*([\\w\\s,.-]+?)${PARTY_STOP}`, 'i');
-    const impRegex = new RegExp(`(?:Imported\\s*By)\\s*[:.-]?\\s*([\\w\\s,.-]+?)${PARTY_STOP}`, 'i');
-    const mktRegex = new RegExp(`(?:Marketed\\s*By)\\s*[:.-]?\\s*([\\w\\s,.-]+?)${PARTY_STOP}`, 'i');
-
-    const mmfr = fullText.match(mfrRegex);
-    if (mmfr && mmfr[1].trim().length > 2 && !/fssai|lic/i.test(mmfr[1])) {
-        mfrName = mmfr[1].trim();
-        mfrElem = rawElements.find(r => /Manufactured/i.test(r.text)) || null;
-    }
-    const mpkr = fullText.match(pkrRegex);
-    if (mpkr && mpkr[1].trim().length > 2) pkrName = mpkr[1].trim();
-    const mimp = fullText.match(impRegex);
-    if (mimp && mimp[1].trim().length > 2) impName = mimp[1].trim();
-    const mmkt = fullText.match(mktRegex);
-    if (mmkt && mmkt[1].trim().length > 2) mktName = mmkt[1].trim();
-
-    // Bug 5 fix: Per-element multi-line search for manufacturer/marketer
-    // When fullText regex fails (PARTY_STOP terminates too eagerly), search element-by-element
-    const SECTION_LABEL_REGEX = /^(?:Manufactured|Mfd\.?\s*By|Marketed|Packed|Imported|FSSAI|Lic|Customer|Consumer|Net\s*(?:Qty|Weight)|MRP|M\.?R\.?P|Batch|Lot|Exp|Best\s*Before|Country|USP|Unit\s*Sale)/i;
-    
-    const accumulatePartyName = (startIdx) => {
-        // Accumulate the next 2-5 elements as company name + address until a new section label
-        let parts = [];
-        for (let j = 1; j <= 5 && startIdx + j < rawElements.length; j++) {
-            const nextText = rawElements[startIdx + j].text.trim();
-            // Stop at next section label
-            if (SECTION_LABEL_REGEX.test(nextText)) break;
-            // Stop at standalone FSSAI / license numbers
-            if (/^\d{14}$/.test(nextText)) break;
-            // Stop at dates
-            if (/^\d{2}[/]\d{4}$/.test(nextText)) break;
-            parts.push(nextText);
-        }
-        return parts.join(', ').trim();
-    };
-
-    if (!mfrName) {
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            if (/(?:Manufactured\s*(?:By|at)|Mfd\.?\s*By)\s*[:.-]?\s*$/i.test(el.text.trim()) ||
-                /(?:Manufactured\s*(?:By|at)|Mfd\.?\s*By)\s*[:.-]?\s*(.+)/i.test(el.text.trim())) {
-                // Check if company name is on same line
-                const inlineMatch = el.text.match(/(?:Manufactured\s*(?:By|at)|Mfd\.?\s*By)\s*[:.-]?\s*(.+)/i);
-                if (inlineMatch && inlineMatch[1].trim().length > 3 && !/fssai|lic/i.test(inlineMatch[1])) {
-                    mfrName = inlineMatch[1].trim();
-                } else {
-                    // Company name in subsequent elements
-                    mfrName = accumulatePartyName(i);
-                }
-                if (mfrName && mfrName.length > 2) {
-                    mfrElem = el;
-                    console.log(`[Extraction] Bug5 fix: Manufacturer recovered via multi-line search: ${mfrName}`);
-                    break;
-                } else {
-                    mfrName = null;
-                }
-            }
-        }
-    }
-    if (!mktName) {
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            if (/Marketed\s*By\s*[:.-]?\s*$/i.test(el.text.trim()) ||
-                /Marketed\s*By\s*[:.-]?\s*(.+)/i.test(el.text.trim())) {
-                const inlineMatch = el.text.match(/Marketed\s*By\s*[:.-]?\s*(.+)/i);
-                if (inlineMatch && inlineMatch[1].trim().length > 3 && !/fssai|lic/i.test(inlineMatch[1])) {
-                    mktName = inlineMatch[1].trim();
-                } else {
-                    mktName = accumulatePartyName(i);
-                }
-                if (mktName && mktName.length > 2) {
-                    console.log(`[Extraction] Bug5 fix: Marketer recovered via multi-line search: ${mktName}`);
-                    break;
-                } else {
-                    mktName = null;
-                }
-            }
-        }
-    }
-
-    // Match prominent corporate entity declarations (e.g. "THE BEVERAGE COMPANY")
-    if (!mfrName && !mktName) {
-        for (let i = 0; i < rawElements.length; i++) {
-            const el = rawElements[i];
-            const cm = el.text.match(/(?:©?\s*\d{4}\s*)?(THE\s+[A-Z0-9\s-]+\s+(?:COMPANY|CORP|CORPORATION|LTD|LIMITED|PVT\s+LTD))/i);
-            if (cm) {
-                mfrName = cm[1].trim();
-                mfrElem = el;
-                break;
-            }
-            if (/THE\s+[A-Z0-9\s-]+/i.test(el.text)) {
-                for (let j = 1; j <= 4 && i + j < rawElements.length; j++) {
-                    if (/^(?:COMPANY|CORP|LTD|CORPORATION|LIMITED)\b/i.test(rawElements[i+j].text)) {
-                        mfrName = `${el.text.replace(/©?\s*\d{4}\s*/, '').trim()} ${rawElements[i+j].text.trim()}`;
-                        mfrElem = el;
-                        break;
-                    }
-                }
-                if (mfrName) break;
-            }
-        }
-    }
-
-    // Phase 5 Fix 3: Spatial pairing fallback for manufacturer/marketer
-    if (!mfrName && spatialPairs['manufacturer.name']) {
-        mfrName = spatialPairs['manufacturer.name'].value;
-        mfrElem = spatialPairs['manufacturer.name'].valueElement;
-        console.log(`[Extraction] Manufacturer recovered via spatial pairing: ${mfrName}`);
-    }
-    if (!mktName && spatialPairs['marketer.name']) {
-        mktName = spatialPairs['marketer.name'].value;
-        console.log(`[Extraction] Marketer recovered via spatial pairing: ${mktName}`);
-    }
-
-    declarations.manufacturer = {
-        name: mfrName,
-        address: null,
-        status: mfrName ? 'verified' : 'not_detected',
-        rawText: mfrElem ? mfrElem.text : null,
-        confidence: mfrElem ? mfrElem.confidence : 0,
-        source: spatialPairs['manufacturer.name'] && mfrName === spatialPairs['manufacturer.name'].value ? 'spatial_pairing' : 'paddleocr_primary',
-        aiAssisted: false
-    };
-    declarations.packer = { name: pkrName, address: null, status: pkrName ? 'verified' : 'not_detected', source: 'paddleocr_primary', aiAssisted: false };
-    declarations.importer = { name: impName, address: null, status: impName ? 'verified' : 'not_detected', source: 'paddleocr_primary', aiAssisted: false };
-    declarations.marketer = { name: mktName, address: null, status: mktName ? 'verified' : 'not_detected', source: spatialPairs['marketer.name'] && mktName === spatialPairs['marketer.name'].value ? 'spatial_pairing' : 'paddleocr_primary', aiAssisted: false };
-
-    validation.manufacturerPackerImporter = {
-        status: (mfrName || pkrName || impName || mktName) ? 'verified' : 'not_detected',
-        reason: (mfrName || pkrName || impName || mktName) ? `Responsible party: ${mfrName || pkrName || impName || mktName}` : 'No responsible party identified'
-    };
-
-    // -------------------------------------------------------------
-    // 9. Consumer Care Details
-    // -------------------------------------------------------------
-    let carePhone = null;
-    let carePhoneElem = null;
-    let careEmail = null;
-    let careEmailElem = null;
-
-    const carePhoneRegex = /(?:Customer Care|Toll Free|Call|Phone|Helpline|For Feedback)[.\s:]*([\d\s+-]{8,18})/i;
-    for (const el of rawElements) {
-        const cpm = el.text.match(carePhoneRegex);
-        if (cpm) {
-            const cln = cpm[1].replace(/[^\d+]/g, '');
-            if (cln.length >= 8) {
-                carePhone = cln;
-                carePhoneElem = el;
-                break;
-            }
-        }
-    }
-    if (!carePhone) {
-        for (const el of rawElements) {
-            const pmatch = el.text.match(/(\+91[- ]?\d{2,4}[- ]?\d{6,8}|\b\d{10,12}\b)/);
-            if (pmatch) {
-                carePhone = pmatch[1].trim();
-                carePhoneElem = el;
-                break;
-            }
-        }
-    }
-
-    const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i;
-    for (const el of rawElements) {
-        const em = el.text.match(emailRegex);
-        if (em) {
-            careEmail = em[1];
-            careEmailElem = el;
-            break;
-        }
-    }
-
-    declarations.consumerCare = {
-        name: null,
-        address: null,
-        phone: carePhone,
-        email: careEmail,
-        status: (carePhone || careEmail) ? 'verified' : 'not_detected',
-        rawText: carePhoneElem ? carePhoneElem.text : (careEmailElem ? careEmailElem.text : null),
-        confidence: carePhoneElem ? carePhoneElem.confidence : 0
-    };
-    validation.consumerCare = {
-        status: (carePhone || careEmail) ? 'verified' : 'not_detected',
-        reason: (carePhone || careEmail) ? `Consumer care contact: ${[carePhone, careEmail].filter(Boolean).join(', ')}` : 'Consumer care details not detected'
-    };
-
-    // -------------------------------------------------------------
-    // 10. Ingredients List
-    // -------------------------------------------------------------
-    let ingredientsText = null;
-    const ingRegex = /(?:Ingredients|INGREDIENTS|NGEDIENTS)\s*[:.-]?\s*([\s\S]+?)(?=(?:Nutrition|NUTRITION|Allergen|ALLERGEN|Mfg|MFG|Best Before|Batch|$))/i;
-    const ingMatch = fullText.match(ingRegex);
-    if (ingMatch) {
-        ingredientsText = ingMatch[1].trim().replace(/\s+/g, ' ');
-    }
-    declarations.ingredients = {
-        value: ingredientsText,
-        status: ingredientsText ? 'verified' : 'not_detected'
-    };
-
-    // -------------------------------------------------------------
-    // 11. Nutrition Facts
-    // -------------------------------------------------------------
-    const nutritionFacts = { calories: null, fat: null, sugar: null, protein: null, sodium: null, carbohydrates: null, fiber: null };
-    const calMatch = fullText.match(/(?:Energy|Calories|Calorie)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*(?:kcal|cal)?/i);
-    if (calMatch) nutritionFacts.calories = parseFloat(calMatch[1]);
-    const proteinMatch = fullText.match(/(?:Protein|Proteins)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
-    if (proteinMatch) nutritionFacts.protein = parseFloat(proteinMatch[1]);
-    const fatMatch = fullText.match(/(?:Total Fat|Fat)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
-    if (fatMatch) nutritionFacts.fat = parseFloat(fatMatch[1]);
-    const sugarMatch = fullText.match(/(?:Total Sugars|Sugars|Sugar|Added Sugars)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
-    if (sugarMatch) nutritionFacts.sugar = parseFloat(sugarMatch[1]);
-    const sodiumMatch = fullText.match(/(?:Sod[il1]um|Salt)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*(mg|g)/i);
-    if (sodiumMatch) {
-        const v = parseFloat(sodiumMatch[1]);
-        nutritionFacts.sodium = sodiumMatch[2].toLowerCase() === 'g' ? v * 1000 : v;
-    }
-    const carbMatch = fullText.match(/(?:Carbohydrate|Carbohydrates|Carbs)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
-    if (carbMatch) nutritionFacts.carbohydrates = parseFloat(carbMatch[1]);
-    const fiberMatch = fullText.match(/(?:Dietary Fiber|Fiber|Dietary Fibre)\s*[:.-]?\s*(\d+(?:\.\d+)?)\s*g/i);
-    if (fiberMatch) nutritionFacts.fiber = parseFloat(fiberMatch[1]);
-    declarations.nutritionFacts = nutritionFacts;
-
-    // -------------------------------------------------------------
-    // 12. Product Name Identification (AFFIRMATIVE TITLE EVIDENCE)
-    // -------------------------------------------------------------
-    let prodName = null;
-    let prodNameElem = null;
-
-    const COMMODITY_NOUNS = /\b(?:oil|whey|protein|creatine|seeds?|capsules?|tablets?|softgels?|syrup|sauce|ketchup|juice|drink|tea|coffee|biscuit|cookies?|snack|chips|noodles|pasta|flour|atta|rice|dal|salt|sugar|water|cola|soda|paste|spread|jam|butter|ghee|paneer|cheese|milk|curd|yogurt|cereal|oats|muesli|honey|vinegar|shampoo|soap|wash|lotion|cream|powder)\b/i;
-
-    // Note: isNonProductTitleCandidate is defined at module scope for shared use
-
-
-    const scoreProductCandidate = (elem) => {
-        const text = elem.text.trim();
-        let score = 0;
-
-        score += (elem.confidence || 0.8) * 15;
-
-        const heights = rawElements.map(e => {
-            if (!e.bbox || e.bbox.length < 4) return 20;
-            const ys = e.bbox.map(p => p[1]);
-            return Math.max(...ys) - Math.min(...ys);
-        }).filter(h => h > 5);
-        heights.sort((a, b) => a - b);
-        const medianHeight = heights.length > 0 ? heights[Math.floor(heights.length / 2)] : 20;
-        
-        let elemHeight = 20;
-        let elemCenterY = 0;
-        if (elem.bbox && elem.bbox.length >= 4) {
-            const ys = elem.bbox.map(p => p[1]);
-            elemHeight = Math.max(...ys) - Math.min(...ys);
-            elemCenterY = (Math.max(...ys) + Math.min(...ys)) / 2;
-        }
-        const heightRatio = elemHeight / medianHeight;
-        score += Math.min(heightRatio, 3.5) * 10;
-
-        const words = text.split(/\s+/);
-        if (words.length >= 2 && words.length <= 6) score += 20;
-        else if (words.length === 1) score += 8;
-        else if (words.length > 6) score -= 15;
-
-        if (/^[A-Z][a-z0-9%]+(?:\s+[A-Z0-9%][a-z0-9%]*)*$/.test(text)) score += 10;
-        else if (/^[A-Z0-9\s&'%.-]+$/.test(text)) score += 8;
-
-        if (COMMODITY_NOUNS.test(text)) score += 25;
-
-        // Corporate trade indicators penalty (e.g. Foods, Labs, Pharma, Nutrition, Mills)
-        // These represent parent companies/brands, not the specific packaged commodity name
-        if (/\b(?:foods|labs|pharma|nutrition|mills|beverages|industries|farms|grains|enterprises|brands|corporation|company)\b/i.test(text)) {
-            score -= 15;
-        }
-
-        const maxImgY = Math.max(...rawElements.flatMap(e => (e.bbox || []).map(p => p[1])), 1000);
-        if (elemCenterY > 0 && maxImgY > 0) {
-            const relY = elemCenterY / maxImgY;
-            if (relY < 0.60) score += 10;
-            else if (relY > 0.80) score -= 10;
-        }
-
-        return { text, score, heightRatio, elemHeight };
-    };
-
-    // Filter valid title candidates using strict rejection gate + generic multi-line reconstruction
-    const validTitleCandidates = generateCandidateTitles(structuredRows, rawElements);
-
-    if (validTitleCandidates.length > 0) {
-        const scoredCandidates = validTitleCandidates.map(c => ({
-            candidate: c,
-            ...scoreProductCandidate(c)
-        }));
-        scoredCandidates.sort((a, b) => b.score - a.score);
-
-        // Require confidence threshold score of at least 60
-        if (scoredCandidates[0].score >= 60) {
-            prodName = scoredCandidates[0].candidate.text.trim();
-            prodNameElem = scoredCandidates[0].candidate;
-        }
-    }
-
-    if (prodName && (isDateShaped(prodName) || isMarketingBadge(prodName) || isNonProductTitleCandidate(prodName))) {
-        prodName = null;
-        prodNameElem = null;
-    }
-
-    declarations.productName = createEvidenceRecord(prodName, prodNameElem, prodName ? 'verified' : 'not_detected');
-    validation.productName = {
-        status: prodName ? 'verified' : 'not_detected',
-        reason: prodName ? `Product name identified: ${prodName}` : 'No affirmative product name declaration detected'
-    };
-
-    // -------------------------------------------------------------
-    // 13. Brand Name Extraction (SEPARATE FROM PRODUCT NAME)
-    // The brand/trade name of the company.
-    // NOT the product/variant name, NOT the generic commodity name.
-    // Marketing/quality badges (100% Authentic, Certified, etc.) are excluded.
-    // -------------------------------------------------------------
-    let brandNameVal = null;
-    let brandNameElem = null;
-
-    // Strategy A: Extract brand from manufacturer/marketer name if available
-    const possibleBrandFromParty = mfrName || mktName;
-
-    // Strategy B: Find prominent uppercase text that looks like a brand
-    const brandCandidates = rawElements.filter(el => {
-        const tr = el.text.trim();
-        // Must be 4-40 chars, not a known non-brand pattern
-        if (tr.length < 4 || tr.length > 40) return false;
-        // Must not be a marketing badge, date-shaped, or instructional/non-identity candidate
-        if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr)) return false;
-        // Exclude month abbreviations
-        if (/^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(tr)) return false;
-        // Exclude generic corporate entities
-        if (/^(?:COMPANY|CORP|CORPORATION|LIMITED|LTD|PVT|LLC|INC)$/i.test(tr)) return false;
-        // Exclude sectional noise, regulatory categories, and fragmented clauses
-        if (/servings?$/i.test(tr) || /ingredients?$/i.test(tr) || /ingredents?$/i.test(tr) || /ceutical/i.test(tr)) return false;
-        if (/\b(?:and|or|with|of|for|the|in|on|at|to)$/i.test(tr)) return false;
-        if (/^(?:and|or|with|of|for|the|in|on|at|to)\b/i.test(tr)) return false;
-        if (/\b(?:heart|skin|joints?|bones?|immunity|brain|eyes?|hair|muscle)\b/i.test(tr)) return false;
-        // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
-        if (/\b(?:fat|sugars?|carbohydrates?|protein|energy|cholesterol|potassium|calcium|iron|vitamin|mineral|capsules?|tablets?|softgels?|nutraceutical|rda)\b/i.test(tr)) return false;
-        if (/\b(?:sod[il1]um|potass[il1]um|calc[il1]um|magn[il1]es[il1]um)\b/i.test(tr)) return false;
-        if (/\b(?:total|added|trans|saturated|monounsaturated|polyunsaturated)\b/i.test(tr)) return false;
-        if (/^(?:nutrition|ingredients?|ngedients?|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings?|quantity|energy|protein|fat|carbohydrate|sugar|sod[il1]um|cholesterol|acid|fatty|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions?|storage|store|keep|allergen|warning|caution|recommen|usage|dosage|suggested|guideline|supplement|customer|consumer|care|contact|feedback|process|facility|manufactur|product|contain|council|percent|table|approx|capsule|tablet|softgel|bottle|pack)/i.test(tr)) return false;
-        // Must not be a date, number-only, or batch code
-        if (/^\d+(?:\.\d+)?$/.test(tr)) return false;
-        if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return false;
-        if (/^\d{14}$/.test(tr)) return false;
-        // Prefer all-uppercase or title-case lines of 1-4 words
-        const words = tr.split(/\s+/);
-        if (words.length > 4) return false;
-        const isUpperOrTitle = /^[A-Z][A-Z\s.-]+$/.test(tr) || /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(tr);
-        return isUpperOrTitle;
-    });
-
-    // Pick the best brand candidate: prefer one that matches a known party name
-    if (possibleBrandFromParty) {
-        const partyWords = possibleBrandFromParty.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-        const matchingCandidate = brandCandidates.find(c => {
-            const cLower = c.text.trim().toLowerCase();
-            return partyWords.some(pw => cLower.includes(pw) || pw.includes(cLower));
-        });
-        if (matchingCandidate) {
-            brandNameVal = matchingCandidate.text.trim();
-            brandNameElem = matchingCandidate;
-        } else {
-            // Strategy A.2: Derive brand directly from corporate party name (e.g. "THE BEVERAGE COMPANY" -> "Beverage")
-            const cleanPartyBrand = possibleBrandFromParty
-                .replace(/^(?:the|©?\s*\d{4})\s+/i, '')
-                .replace(/\s+(?:company|corp|corporation|ltd|limited|pvt|llc|inc)\b.*/i, '')
-                .trim();
-            if (cleanPartyBrand.length >= 3 && !isMarketingBadge(cleanPartyBrand) && !isDateShaped(cleanPartyBrand)) {
-                brandNameVal = cleanPartyBrand;
-                brandNameElem = mfrElem;
-            }
-        }
-    }
-    // Fallback: use the most prominent candidate by bbox area (must have display-heading prominence)
-    if (!brandNameVal && brandCandidates.length > 0) {
-        const elemHeights = rawElements.map(e => {
-            if (!e.bbox || e.bbox.length < 4) return 20;
-            const ys = e.bbox.map(p => p[1]);
-            return Math.max(...ys) - Math.min(...ys);
-        }).filter(h => h > 5);
-        elemHeights.sort((a, b) => a - b);
-        const medianH = elemHeights.length > 0 ? elemHeights[Math.floor(elemHeights.length / 2)] : 20;
-
-        let bestArea = 0;
-        for (const c of brandCandidates) {
-            if (c.bbox && c.bbox.length >= 4) {
-                const xs = c.bbox.map(p => p[0]);
-                const ys = c.bbox.map(p => p[1]);
-                const cHeight = Math.max(...ys) - Math.min(...ys);
-                // Packaging brand display headings must have font prominence above normal body text
-                if (cHeight < medianH * 1.25 && cHeight < 24) continue;
-                const area = (Math.max(...xs) - Math.min(...xs)) * cHeight;
-                if (area > bestArea) {
-                    bestArea = area;
-                    brandNameVal = c.text.trim();
-                    brandNameElem = c;
-                }
-            }
-        }
-    }
-
-    if (brandNameVal && (isDateShaped(brandNameVal) || isMarketingBadge(brandNameVal) || isNonProductTitleCandidate(brandNameVal))) {
-        brandNameVal = null;
-        brandNameElem = null;
-    }
-
-    declarations.brandName = createEvidenceRecord(brandNameVal, brandNameElem, brandNameVal ? 'verified' : 'not_detected');
-    validation.brandName = {
-        status: brandNameVal ? 'verified' : 'not_detected',
-        reason: brandNameVal ? `Brand name identified: ${brandNameVal}` : 'Brand name not separately detected'
-    };
-
-    // Disambiguation: If brand matches what was picked as productName,
-    // re-assign productName to the next best candidate
-    let identityCollisionResolved = false;
-    if (brandNameVal && prodName && brandNameVal.toLowerCase().trim() === prodName.toLowerCase().trim()) {
-        const nextProductCandidates = rawElements.filter(el => {
-            const tr = el.text.trim();
-            if (tr.length < 3 || tr.length > 60) return false;
-            if (tr.toLowerCase() === brandNameVal.toLowerCase()) return false;
-            if (isMarketingBadge(tr) || isDateShaped(tr) || isNonProductTitleCandidate(tr)) return false;
-            return true;
-        }).map(c => ({ candidate: c, ...scoreProductCandidate(c) }));
-        
-        nextProductCandidates.sort((a, b) => b.score - a.score);
-        if (nextProductCandidates.length > 0 && nextProductCandidates[0].score >= 45) {
-            prodName = nextProductCandidates[0].candidate.text.trim();
-            prodNameElem = nextProductCandidates[0].candidate;
-            declarations.productName = createEvidenceRecord(prodName, prodNameElem, 'verified');
-            validation.productName = {
-                status: 'verified',
-                reason: `Product name re-identified after brand separation: ${prodName}`
-            };
-            identityCollisionResolved = true;
-            console.log(`[Extraction] Brand/product disambiguation: brand="${brandNameVal}", product="${prodName}"`);
-        }
-    }
-
-    // Disambiguation: If productName begins with brandNameVal (e.g. brand="AURORA FOODS", product="AURORA FOODS CHIA SEEDS")
-    if (brandNameVal && prodName) {
-        const brandNorm = brandNameVal.toLowerCase().trim();
-        const prodNorm = prodName.toLowerCase().trim();
-        if (prodNorm.startsWith(brandNorm) && prodNorm.length > brandNorm.length) {
-            const stripped = prodName.slice(brandNameVal.length).replace(/^[\s:-]+/, '').trim();
-            if (stripped.length >= 3 && !isDateShaped(stripped) && !isMarketingBadge(stripped) && !isNonProductTitleCandidate(stripped)) {
-                console.log(`[Extraction] Stripped brand prefix from productName: "${prodName}" -> "${stripped}" (brand: "${brandNameVal}")`);
-                prodName = stripped;
-                declarations.productName = createEvidenceRecord(prodName, prodNameElem, 'verified');
-                validation.productName = {
-                    status: 'verified',
-                    reason: `Product name re-identified after brand separation: ${prodName}`
-                };
-            }
-        }
-    }
-
-    // -------------------------------------------------------------
-    // 14. Generic Commodity Name Extraction (Legal Metrology requirement)
-    // The common/generic name of the commodity as required by Legal Metrology
-    // rules as a separate declaration from the marketing/brand name.
-    // -------------------------------------------------------------
-    let genericCommodityNameVal = null;
-    let genericCommodityNameElem = null;
-
-    // Strategy A: Look for explicit "Common Name" / "Generic Name" label on the pack
-    const genericNameLabelRegex = /(?:Common\s*(?:Name|Commodity)|Generic\s*Name|Name\s*of\s*(?:the\s*)?(?:Food|Product|Commodity))\s*[:.-]?\s*(.+)/i;
-    for (const el of rawElements) {
-        const gnm = el.text.match(genericNameLabelRegex);
-        if (gnm && gnm[1].trim().length > 2) {
-            const candidate = gnm[1].trim();
-            // Stop at field boundaries
-            const truncated = candidate.replace(/\b(?:Manufactured|Marketed|Packed|Imported|FSSAI|Net|MRP|Batch|Exp|Best|Country)\b.*/i, '').trim();
-            if (truncated.length > 2 && !isMarketingBadge(truncated) && !isDateShaped(truncated)) {
-                genericCommodityNameVal = truncated;
-                genericCommodityNameElem = el;
-                break;
-            }
-        }
-    }
-
-    // Strategy B: If no explicit label is printed on the package, leave as null for the first pass.
-    // The mandatory Gemini verification pass will classify/verify genericCommodityName using visual reasoning.
-
-    declarations.genericCommodityName = createEvidenceRecord(
-        genericCommodityNameVal, genericCommodityNameElem,
-        genericCommodityNameVal ? 'verified' : 'not_detected',
-        [],
-        genericCommodityNameVal ? 'ocr_explicit_label' : 'paddleocr_primary'
-    );
-    validation.genericCommodityName = {
-        status: genericCommodityNameVal ? 'verified' : 'not_detected',
-        reason: genericCommodityNameVal
-            ? `Generic commodity name identified: ${genericCommodityNameVal}`
-            : 'Generic commodity name not separately detected'
-    };
-
-    // -------------------------------------------------------------
-    // 15. Post-Extraction Format Validation
-    // Validate fields with well-defined shapes. Non-conforming values
-    // get status: 'REVIEW' and value: null so Gemini fallback can recover them.
-    // -------------------------------------------------------------
-    const netQtyValidation = validateFieldFormat('netQuantity', netQtyVal ? { value: netQtyVal, unit: netQtyUnit } : netQtyElem?.text);
-    if (!netQtyValidation.valid) {
-        console.warn(`[Extraction] Format validation rejected netQuantity: ${netQtyValidation.reason} (raw: "${netQtyElem?.text}"`);
-        // Keep the parsed numeric value/unit only if the raw text was clean
-        // If contaminated, null it out
-        netQtyVal = null;
-        netQtyUnit = null;
-        declarations.netQuantity.value = null;
-        declarations.netQuantity.status = 'review';
-        validation.netQuantity.status = 'review';
-        validation.netQuantity.reason = `Extracted value failed format check: ${netQtyValidation.reason}`;
-    }
-
-    const datesMfgValidation = validateFieldFormat('dates.manufacture', mfgVal);
-    if (!datesMfgValidation.valid && mfgVal) {
-        console.warn(`[Extraction] Format validation rejected manufacture date: ${datesMfgValidation.reason}`);
-        mfgVal = null;
-        declarations.manufacturingDate.value = null;
-        declarations.manufacturingDate.status = 'review';
-    }
-
-    const datesExpValidation = validateFieldFormat('dates.expiry', expVal);
-    if (!datesExpValidation.valid && expVal) {
-        console.warn(`[Extraction] Format validation rejected expiry date: ${datesExpValidation.reason}`);
-        expVal = null;
-        declarations.expiryDate.value = null;
-        declarations.expiryDate.status = 'review';
-    }
-
-    const batchValidation = validateFieldFormat('batchNumber', batchVal);
-    if (!batchValidation.valid && batchVal) {
-        console.warn(`[Extraction] Format validation rejected batch number: ${batchValidation.reason}`);
-        batchVal = null;
-        declarations.batchNumber.value = null;
-        declarations.batchNumber.status = 'review';
-    }
-
-    // -------------------------------------------------------------
-    // Build Canonical Normalized Fields Object
-    // -------------------------------------------------------------
-    const normalizedFields = {
-        productName: sanitizeExtractedText(prodName),
-        brandName: sanitizeExtractedText(brandNameVal),
-        genericCommodityName: sanitizeExtractedText(genericCommodityNameVal),
-        batchNumber: sanitizeExtractedText(batchVal),
-        fssaiLicenseNumber: sanitizeExtractedText(fssaiVal),
-        manufacturer: { name: sanitizeExtractedText(mfrName), address: null },
-        packer: { name: sanitizeExtractedText(pkrName), address: null },
-        importer: { name: sanitizeExtractedText(impName), address: null },
-        marketer: { name: sanitizeExtractedText(mktName), address: null },
-        netQuantity: { value: netQtyVal, unit: sanitizeExtractedText(netQtyUnit) },
-        servingsPerContainer: servingsPerContainer,
-        servingSize: sanitizeExtractedText(servingSize),
-        mrp: { value: mrpVal, currency: 'INR', inclusiveOfTaxes: inclTaxes },
-        dates: { manufacture: sanitizeExtractedText(mfgVal), expiry: sanitizeExtractedText(expVal), bestBefore: sanitizeExtractedText(bbVal) },
-        consumerCare: { name: null, address: null, phone: sanitizeExtractedText(carePhone), email: sanitizeExtractedText(careEmail) },
-        countryOfOrigin: sanitizeExtractedText(countryVal),
-        unitSalePrice: sanitizeExtractedText(uspVal),
-        dimensions: null,
-        ingredients: sanitizeExtractedText(ingredientsText),
-        nutritionFacts: nutritionFacts,
-        structuredRows: structuredRows.rows,
-        rawOcrText: rawElements.map(r => {
-            const entry = {
-                text: (r.text || '').trim(),
-                confidence: typeof r.confidence === 'number' ? r.confidence : 0.8,
-                bbox: r.bbox || r.boundingBox || []
-            };
-            // Normalize bbox to 0–1 fractions using this photo's own dimensions
-            // so multi-photo scans have resolution-independent coordinates (Issue 4)
-            if (sourceImageWidth > 0 && sourceImageHeight > 0 && Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
-                entry.bbox = entry.bbox.map(pt => [
-                    pt[0] / sourceImageWidth,
-                    pt[1] / sourceImageHeight
-                ]);
-            } else if (Array.isArray(entry.bbox) && entry.bbox.length >= 4) {
-                // No image dimensions available — degrade safely to empty bbox
-                entry.bbox = [];
-            }
-            return entry;
-        }).filter(r => Boolean(r.text))
-    };
-
-    // Phase 5: Collect fields that are low-confidence or undetected for Gemini fallback
-    const lowConfidenceFields = [];
-    const checkField = (name, val, conf = 0) => {
-        if (val === null || val === undefined || val === '') lowConfidenceFields.push(name);
-        else if (typeof conf === 'number' && conf < GEMINI_FALLBACK_CONFIDENCE_THRESHOLD && conf > 0) lowConfidenceFields.push(name);
-    };
-    checkField('productName', prodName, prodNameElem?.confidence);
-    checkField('brandName', brandNameVal, brandNameElem?.confidence);
-    checkField('genericCommodityName', genericCommodityNameVal, genericCommodityNameElem?.confidence);
-    checkField('manufacturer.name', mfrName, mfrElem?.confidence);
-    checkField('manufacturer.address', null); // addresses are always undetected in regex
-    checkField('marketer.name', mktName);
-    checkField('mrp', mrpVal, mrpElem?.confidence);
-    checkField('unitSalePrice', uspVal, uspElem?.confidence);
-    checkField('netQuantity', netQtyVal, netQtyElem?.confidence);
-    checkField('countryOfOrigin', countryVal, countryElem?.confidence);
-    checkField('consumerCare.phone', carePhone, carePhoneElem?.confidence);
-    checkField('consumerCare.email', careEmail, careEmailElem?.confidence);
-
-    return {
-        ...normalizedFields, // Backwards compatibility for existing consumers
-        declarations,
-        normalizedFields,
-        validation,
-        sourceImageId,
-        identityCollisionResolved,
-        structuredRows: structuredRows.rows,
-        lowConfidenceFields // Phase 5: for Gemini fallback
-    };
-};
-
-/**
- * Safely sets a deeply nested property on an object using dot-path notation.
- * e.g. setNestedField(merged, 'manufacturer.name', 'Acme Corp')
- */
-const setNestedField = (obj, path, value) => {
-    const parts = path.split('.');
-    let target = obj;
-    for (let i = 0; i < parts.length - 1; i++) {
-        if (target[parts[i]] === undefined || target[parts[i]] === null || typeof target[parts[i]] !== 'object') {
-            target[parts[i]] = {};
-        }
-        target = target[parts[i]];
-    }
-    target[parts[parts.length - 1]] = value;
-};
-
-/**
- * Phase 5 Fix 1: Enhanced multi-angle reconciliation
- * 
- * Two-phase approach:
- * 1. Basic normalization: strip whitespace/punctuation/case, check substring/overlap
- * 2. Gemini semantic reconciliation: for remaining unresolved conflicts
- * 
- * Also performs brand/productName/genericName classification via Gemini.
- * 
- * @param {Array<Object>} extractedList - Single-photo extracted fields array.
- * @param {Array<Buffer>} imageBuffers - Optional image buffers for Gemini fallback.
- * @returns {Promise<Object>} Reconciled canonical scan record.
- */
-const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers = []) => {
-    if (!Array.isArray(extractedList) || extractedList.length === 0) {
-        return extractFields([]);
-    }
-
-    const merged = {
+    const emptyNormalized = {
         productName: null,
         brandName: null,
         genericCommodityName: null,
@@ -2153,890 +108,241 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             carbohydrates: null,
             fiber: null
         },
-        rawOcrText: [],
-        conflicts: [],
-        photoCount: extractedList.length,
+        structuredRows: structuredRows.rows,
+        rawOcrText: normalizedRawOcr
+    };
+
+    if (options.deterministic) {
+        return extractFieldsDeterministic(rawElements, structuredRows, { imageWidth: sourceImageWidth, imageHeight: sourceImageHeight }, sourceImageId);
+    }
+
+    return {
+        ...emptyNormalized,
+        normalizedFields: emptyNormalized,
         declarations: {},
-        reconciliation: {
-            fields: {},
-            conflicts: [],
-            geminiUsed: false
-        },
-        _singleExtractions: extractedList
+        validation: {},
+        sourceImageId,
+        structuredRows: structuredRows.rows,
+        _structuredRowsObj: structuredRows,
+        candidateHints,
+        rawOcrText: normalizedRawOcr,
+        imageWidth: sourceImageWidth,
+        imageHeight: sourceImageHeight
     };
-
-    // Combine raw OCR elements and initialize merged declarations
-    extractedList.forEach(ext => {
-        if (Array.isArray(ext.rawOcrText)) {
-            merged.rawOcrText.push(...ext.rawOcrText);
-        }
-        if (ext.declarations) {
-            Object.entries(ext.declarations).forEach(([k, decl]) => {
-                if (!merged.declarations[k] || (decl && decl.status === 'verified' && merged.declarations[k].status !== 'verified')) {
-                    merged.declarations[k] = { ...decl };
-                }
-            });
-        }
-    });
-
-    // =========================================================================
-    // Phase 5 Fix 1: Two-phase reconciliation helpers
-    // =========================================================================
-
-    /**
-     * Basic normalization: removes whitespace, punctuation, converts to lowercase.
-     * Used for Phase 1 comparison before Gemini.
-     */
-    const normalize = (s) => {
-        if (typeof s !== 'string') return String(s || '').toLowerCase().trim();
-        return s.toLowerCase().replace(/[^a-z0-9]/gi, '').trim();
-    };
-
-    /**
-     * Check if two values are "close enough" without needing Gemini:
-     * - Case-insensitive match
-     * - One is a substring of the other  
-     * - >80% word overlap
-     */
-    const isBasicallyEqual = (a, b) => {
-        const na = normalize(a);
-        const nb = normalize(b);
-        if (na === nb) return true;
-        if (na.includes(nb) || nb.includes(na)) return true;
-
-        // Word overlap check
-        const wordsA = a.toLowerCase().split(/\s+/).filter(w => w.length > 1);
-        const wordsB = b.toLowerCase().split(/\s+/).filter(w => w.length > 1);
-        if (wordsA.length === 0 || wordsB.length === 0) return false;
-        const overlap = wordsA.filter(w => wordsB.some(w2 => w.includes(w2) || w2.includes(w)));
-        const overlapRatio = overlap.length / Math.min(wordsA.length, wordsB.length);
-        return overlapRatio >= 0.8;
-    };
-
-    // Fields that need Gemini semantic reconciliation
-    const fieldsNeedingGemini = {};
-
-    /**
-     * Reconcile a specific field across all photo extractions.
-     * Phase 1: basic normalization. Unresolved conflicts are collected for Gemini.
-     */
-    const reconcileField = (fieldName, getter, setter, isDifferent = (a, b) => a !== b) => {
-        const observations = [];
-        extractedList.forEach((ext, idx) => {
-            const val = getter(ext);
-            if (val !== null && val !== undefined && val !== '') {
-                observations.push({
-                    imageId: ext.sourceImageId || `Photo #${idx + 1}`,
-                    photoIndex: idx + 1,
-                    value: val,
-                    rawText: ext.declarations?.[fieldName]?.rawText || JSON.stringify(val)
-                });
-            }
-        });
-
-        let fieldStatus = 'not_detected';
-        let resolvedValue = null;
-
-        if (observations.length === 0) {
-            fieldStatus = 'not_detected';
-        } else if (observations.length === 1) {
-            fieldStatus = 'single_observation';
-            resolvedValue = observations[0].value;
-            setter(merged, resolvedValue);
-        } else {
-            // Multiple observations: check for material conflict
-            const uniqueVals = [];
-            observations.forEach(obs => {
-                if (!uniqueVals.some(u => !isDifferent(u.value, obs.value))) {
-                    uniqueVals.push(obs);
-                }
-            });
-
-            if (uniqueVals.length === 1) {
-                fieldStatus = 'consistent';
-                resolvedValue = uniqueVals[0].value;
-                setter(merged, resolvedValue);
-            } else {
-                // Try basic normalization first
-                const allBasicallyEqual = uniqueVals.every((u, i) => 
-                    i === 0 || isBasicallyEqual(String(u.value), String(uniqueVals[0].value))
-                );
-
-                if (allBasicallyEqual) {
-                    fieldStatus = 'reconciled_basic';
-                    const best = uniqueVals.reduce((a, b) => 
-                        String(a.value).length >= String(b.value).length ? a : b
-                    );
-                    resolvedValue = best.value;
-                    setter(merged, resolvedValue);
-                    console.log(`[Reconciliation] ${fieldName}: basic normalization resolved — "${resolvedValue}"`);
-                } else {
-                    fieldStatus = 'pending_gemini';
-                    resolvedValue = observations[0].value;
-                    setter(merged, resolvedValue);
-
-                    fieldsNeedingGemini[fieldName] = uniqueVals.map(u => ({
-                        value: String(u.value),
-                        photoId: `Photo #${u.photoIndex}`,
-                        rawText: u.rawText
-                    }));
-                }
-            }
-        }
-
-        merged.reconciliation.fields[fieldName] = {
-            field: fieldName,
-            status: fieldStatus,
-            observations,
-            resolvedValue
-        };
-    };
-
-    // 1. Reconcile Product Name (Case-insensitive comparison)
-    reconcileField(
-        'productName',
-        e => e.productName,
-        (m, v) => m.productName = v,
-        (a, b) => a.toLowerCase().trim() !== b.toLowerCase().trim()
-    );
-
-    // 1b. Reconcile Brand Name (separate identity field)
-    reconcileField(
-        'brandName',
-        e => e.brandName,
-        (m, v) => m.brandName = v,
-        (a, b) => a.toLowerCase().trim() !== b.toLowerCase().trim()
-    );
-
-    // 1c. Reconcile Generic Commodity Name (separate identity field)
-    reconcileField(
-        'genericCommodityName',
-        e => e.genericCommodityName,
-        (m, v) => m.genericCommodityName = v,
-        (a, b) => a.toLowerCase().trim() !== b.toLowerCase().trim()
-    );
-
-    // 2. Reconcile MRP (Numeric tolerance)
-    reconcileField(
-        'mrp',
-        e => e.mrp?.value,
-        (m, v) => {
-            if (!m.mrp) m.mrp = { value: null, currency: 'INR', inclusiveOfTaxes: null };
-            m.mrp.value = v;
-        },
-        (a, b) => Math.abs(Number(a) - Number(b)) > 0.01
-    );
-    const anyIncl = extractedList.some(e => e.mrp?.inclusiveOfTaxes);
-    if (anyIncl) merged.mrp.inclusiveOfTaxes = true;
-
-    // 3. Reconcile Net Quantity
-    reconcileField(
-        'netQuantity',
-        e => e.netQuantity?.value ? `${e.netQuantity.value} ${e.netQuantity.unit || ''}`.trim() : null,
-        (m, v) => {
-            const parts = v.split(' ');
-            m.netQuantity = {
-                value: parseFloat(parts[0]),
-                unit: parts[1] || null
-            };
-        },
-        (a, b) => a.toLowerCase().trim() !== b.toLowerCase().trim()
-    );
-
-    // 4-5. Reconcile Servings
-    reconcileField('servingsPerContainer', e => e.servingsPerContainer, (m, v) => m.servingsPerContainer = v, (a, b) => Number(a) !== Number(b));
-    reconcileField('servingSize', e => e.servingSize, (m, v) => m.servingSize = v, (a, b) => a.toLowerCase().trim() !== b.toLowerCase().trim());
-
-    // 6. Reconcile Dates
-    reconcileField('dates.manufacture', e => e.dates?.manufacture, (m, v) => m.dates.manufacture = v, (a, b) => a.toUpperCase().replace(/\s+/g, '') !== b.toUpperCase().replace(/\s+/g, ''));
-    reconcileField('dates.expiry', e => e.dates?.expiry, (m, v) => m.dates.expiry = v, (a, b) => a.toUpperCase().replace(/\s+/g, '') !== b.toUpperCase().replace(/\s+/g, ''));
-    reconcileField('dates.bestBefore', e => e.dates?.bestBefore, (m, v) => m.dates.bestBefore = v);
-
-    // 7-8. Reconcile IDs
-    reconcileField('batchNumber', e => e.batchNumber, (m, v) => m.batchNumber = v, (a, b) => a.toUpperCase().trim() !== b.toUpperCase().trim());
-    reconcileField('fssaiLicenseNumber', e => e.fssaiLicenseNumber, (m, v) => m.fssaiLicenseNumber = v, (a, b) => a.trim() !== b.trim());
-
-    // 9. Reconcile Parties
-    reconcileField('manufacturer.name', e => e.manufacturer?.name, (m, v) => m.manufacturer.name = v);
-    reconcileField('packer.name', e => e.packer?.name, (m, v) => m.packer.name = v);
-    reconcileField('importer.name', e => e.importer?.name, (m, v) => m.importer.name = v);
-    reconcileField('marketer.name', e => e.marketer?.name, (m, v) => m.marketer.name = v);
-
-    // 10. Reconcile Consumer Care & Origin
-    reconcileField('consumerCare.phone', e => e.consumerCare?.phone, (m, v) => m.consumerCare.phone = v);
-    reconcileField('consumerCare.email', e => e.consumerCare?.email, (m, v) => m.consumerCare.email = v);
-    reconcileField('countryOfOrigin', e => e.countryOfOrigin, (m, v) => m.countryOfOrigin = v);
-    reconcileField('unitSalePrice', e => e.unitSalePrice, (m, v) => m.unitSalePrice = v);
-
-    // 11. Ingredients & Nutrition Facts Merging
-    const ingredientsFound = extractedList.map(e => e.ingredients).filter(Boolean);
-    if (ingredientsFound.length > 0) {
-        ingredientsFound.sort((a, b) => b.length - a.length);
-        merged.ingredients = ingredientsFound[0];
-    }
-    extractedList.forEach(e => {
-        const n = e.nutritionFacts || {};
-        if (n.calories !== null && merged.nutritionFacts.calories === null) merged.nutritionFacts.calories = n.calories;
-        if (n.fat !== null && merged.nutritionFacts.fat === null) merged.nutritionFacts.fat = n.fat;
-        if (n.sugar !== null && merged.nutritionFacts.sugar === null) merged.nutritionFacts.sugar = n.sugar;
-        if (n.protein !== null && merged.nutritionFacts.protein === null) merged.nutritionFacts.protein = n.protein;
-        if (n.sodium !== null && merged.nutritionFacts.sodium === null) merged.nutritionFacts.sodium = n.sodium;
-        if (n.carbohydrates !== null && merged.nutritionFacts.carbohydrates === null) merged.nutritionFacts.carbohydrates = n.carbohydrates;
-        if (n.fiber !== null && merged.nutritionFacts.fiber === null) merged.nutritionFacts.fiber = n.fiber;
-    });
-
-    // =========================================================================
-    // Semantic Identity Arbitration via GPT-OSS 120B (Groq API)
-    // Resolves genuine ambiguity for productName, brandName, genericCommodityName
-    // while keeping all statutory/numeric declarations strictly deterministic.
-    // =========================================================================
-    const identityFields = ['productName', 'brandName', 'genericCommodityName'];
-    const unresolvedIdentityFields = identityFields.filter(f => {
-        const val = merged[f];
-        const decl = merged.declarations?.[f];
-        const reconField = merged.reconciliation?.fields?.[f];
-
-        // 1. If explicitly queued for semantic reconciliation
-        if (fieldsNeedingGemini[f] && fieldsNeedingGemini[f].length > 0) return true;
-
-        // 2. If missing or unverified in reconciliation
-        if (!val || reconField?.status === 'pending_gemini' || reconField?.status === 'not_detected') return true;
-        if (!decl || decl.status !== 'verified') return true;
-        if (decl.confidence !== undefined && decl.confidence < 0.85) return true;
-        if (merged.conflicts?.some(c => c.field === f)) return true;
-
-        // 3. Multi-photo ambiguity: differing non-empty values observed across photos
-        const distinctObs = new Set(
-            extractedList.map(e => e[f]).filter(Boolean).map(v => String(v).trim().toLowerCase())
-        );
-        if (distinctObs.size > 1) return true;
-
-        // 4. Competing title candidates: If brand or product was assigned heuristically
-        // and multiple candidates exist across photos, arbitrate to avoid brand/product inversion
-        if (f === 'productName' || f === 'brandName') {
-            // 4a. A same-photo brand/product naming collision was detected and
-            // resolved heuristically for at least one photo — always re-verify
-            // both identity fields regardless of the other heuristics above.
-            if (extractedList.some(e => e.identityCollisionResolved)) {
-                return true;
-            }
-            const hasMultipleCandidates = extractedList.some(e => (e.rawOcrText || []).length >= 2);
-            const isHeuristic = extractedList.some(e => {
-                const s = e.declarations?.[f]?.source;
-                // Every productName/brandName value created by the deterministic
-                // scoring path defaults to source 'paddleocr_primary'. Only a value
-                // already confirmed by an LLM pass should be treated as non-heuristic.
-                return !s || s === 'paddleocr_primary';
-            });
-            if (hasMultipleCandidates && isHeuristic && (!merged.genericCommodityName || distinctObs.size > 0)) {
-                return true;
-            }
-        }
-
-        return false;
-    });
-
-    if (unresolvedIdentityFields.length > 0 && gptOssService.isAvailable()) {
-        console.log(`[Reconciliation] Invoking GPT-OSS 120B for ambiguous identity fields:`, unresolvedIdentityFields);
-
-        // Aggregate deterministic candidates across photos
-        const deterministicCandidates = [];
-        extractedList.forEach((e, idx) => {
-            identityFields.forEach(f => {
-                const val = e[f];
-                const decl = e.declarations?.[f];
-                if (val) {
-                    deterministicCandidates.push({
-                        field: f,
-                        photoId: `Photo #${idx + 1}`,
-                        text: String(val),
-                        confidence: decl?.confidence || 0.8,
-                        score: decl?.score || 0
-                    });
-                }
-            });
-        });
-
-        // Collect all OCR text tokens across photos, including reconstructed rows for grounding
-        const allOcrTokens = [];
-        extractedList.forEach(e => {
-            if (Array.isArray(e.rawOcrText)) {
-                e.rawOcrText.forEach(t => allOcrTokens.push(t));
-            }
-            if (Array.isArray(e.structuredRows)) {
-                e.structuredRows.forEach(r => {
-                    if (r && r.text) {
-                        allOcrTokens.push({
-                            text: r.text,
-                            confidence: 0.9,
-                            bbox: r.elements?.[0]?.bbox || []
-                        });
-                    }
-                });
-            }
-        });
-
-        try {
-            const gptOssResult = await gptOssService.resolveIdentityFields({
-                unresolvedFields: unresolvedIdentityFields,
-                deterministicCandidates,
-                rawOcrTokens: allOcrTokens,
-                imageMeta: { width: 1, height: 1 }   // tokens are pre-normalized 0-1
-            });
-
-            if (gptOssResult.success && gptOssResult.decisions) {
-                merged.reconciliation.gptOssUsed = true;
-                merged.reconciliation.gptOssModel = gptOssResult.model;
-
-                for (const field of unresolvedIdentityFields) {
-                    const decision = gptOssResult.decisions[field];
-                    if (decision && decision.value) {
-                        const validation = validateFieldFormat(field, decision.value);
-                        if (validation.valid) {
-                            console.log(`[Reconciliation] GPT-OSS 120B resolved ${field}: "${merged[field]}" -> "${decision.value}" (${decision.reason})`);
-                            merged[field] = decision.value;
-                            if (!merged.declarations[field]) merged.declarations[field] = { value: null };
-                            merged.declarations[field].value = decision.value;
-                            merged.declarations[field].source = (field === 'genericCommodityName') ? 'llm_inferred' : 'gpt_oss_120b';
-                            merged.declarations[field].aiAssisted = true;
-                            merged.declarations[field].status = 'ai_assisted';
-                            merged.declarations[field].confidence = decision.confidence;
-                            merged.declarations[field].reasoning = decision.reason;
-
-                            if (merged.reconciliation?.fields?.[field]) {
-                                merged.reconciliation.fields[field].status = 'gpt_oss_resolved';
-                                merged.reconciliation.fields[field].resolvedValue = decision.value;
-                                merged.reconciliation.fields[field].gptOssReasoning = decision.reason;
-                            }
-
-                            // Remove from fields needing Gemini if already resolved
-                            delete fieldsNeedingGemini[field];
-                            // Track exactly which fields GPT-OSS actually resolved
-                            merged.reconciliation.gptOssResolvedFields = merged.reconciliation.gptOssResolvedFields || [];
-                            merged.reconciliation.gptOssResolvedFields.push(field);
-                        } else {
-                            console.warn(`[Reconciliation] Format check rejected GPT-OSS 120B ${field}: "${decision.value}" (${validation.reason})`);
-                        }
-                    }
-                }
-            } else if (!gptOssResult.skipped) {
-                console.warn('[Reconciliation] GPT-OSS 120B was unable to resolve fields:', gptOssResult.reason || gptOssResult.error);
-            }
-        } catch (gptErr) {
-            console.warn('[Reconciliation] GPT-OSS 120B invocation caught exception:', gptErr.message);
-        }
-
-        // Only remove identity fields from Gemini queue if GPT-OSS actually resolved them
-        // (not blanket removal — fields GPT-OSS failed on or never tried should still go to Gemini)
-        const resolvedByGptOss = merged.reconciliation.gptOssResolvedFields || [];
-        identityFields.forEach(f => {
-            if (resolvedByGptOss.includes(f)) {
-                delete fieldsNeedingGemini[f];
-            }
-        });
-    }
-
-    // =========================================================================
-    // Phase 5 Fix 1 — Phase 2: Mandatory Gemini Verification for Identity Fields
-    // Per-field check: only skip fields that GPT-OSS actually resolved successfully.
-    // Fields GPT-OSS never tried (gate didn't fire), or failed on (API error,
-    // rate limit, format rejection) still go to Gemini for verification.
-    // =========================================================================
-    {
-        const gptOssResolved = merged.reconciliation.gptOssResolvedFields || [];
-        const highStakesVerificationFields = ['brandName', 'productName', 'genericCommodityName'];
-        highStakesVerificationFields.forEach(f => {
-            // Skip only if GPT-OSS actually resolved this specific field
-            if (gptOssResolved.includes(f)) return;
-            if (!fieldsNeedingGemini[f]) {
-                const obs = extractedList.map((e, idx) => {
-                    const val = f.includes('.') ? e[f.split('.')[0]]?.[f.split('.')[1]] : e[f];
-                    return val ? {
-                        value: String(val),
-                        photoId: `Photo #${idx + 1}`,
-                        rawText: String(val),
-                        identityCollision: Boolean(e.identityCollisionResolved)
-                    } : null;
-                }).filter(Boolean);
-                fieldsNeedingGemini[f] = obs.length > 0 ? obs : [{ value: '', photoId: 'Photo #1', rawText: '' }];
-            }
-        });
-    }
-
-    let geminiResult = null;
-    if (Object.keys(fieldsNeedingGemini).length > 0 && geminiService.isAvailable()) {
-        console.log(`[Reconciliation] Running Gemini verification on ${Object.keys(fieldsNeedingGemini).length} field(s):`, Object.keys(fieldsNeedingGemini));
-        
-        try {
-            const allOcrTexts = (merged.rawOcrText || []).map(r => r.text || '').filter(Boolean);
-            geminiResult = await geminiService.reconcileFields(fieldsNeedingGemini, allOcrTexts);
-            merged.reconciliation.geminiUsed = true;
-            
-            if (!geminiResult.skipped && geminiResult.reconciledFields) {
-                for (const [fieldName, result] of Object.entries(geminiResult.reconciledFields)) {
-                    const reconField = merged.reconciliation.fields[fieldName];
-                    
-                    if (result.isConflict) {
-                        // Gemini confirmed genuine conflict
-                        if (reconField) {
-                            reconField.status = 'confirmed_conflict';
-                            reconField.geminiReasoning = result.reasoning;
-                        }
-                        
-                        const conflictRecord = {
-                            field: fieldName,
-                            detectedValues: (fieldsNeedingGemini[fieldName] || []).map(c => ({
-                                photo: c.photoId,
-                                value: c.value
-                            })),
-                            message: `Confirmed conflict: ${result.reasoning}`,
-                            confirmedByGemini: true
-                        };
-                        merged.conflicts.push(conflictRecord);
-                        merged.reconciliation.conflicts.push(conflictRecord);
-
-                        // If an identity field is in conflict, do not preserve conflicting value as verified
-                        if (fieldName === 'productName' || fieldName === 'brandName') {
-                            merged[fieldName] = null;
-                            if (merged.declarations && merged.declarations[fieldName]) {
-                                merged.declarations[fieldName].value = null;
-                                merged.declarations[fieldName].status = 'not_detected';
-                            }
-                            if (merged.validation && merged.validation[fieldName]) {
-                                merged.validation[fieldName] = {
-                                    status: 'not_detected',
-                                    reason: `Conflict in ${fieldName} could not be resolved: ${result.reasoning}`
-                                };
-                            }
-                        }
-                    } else if (result.value) {
-                        // Enforce format validation before accepting reconciled value
-                        const formatVal = validateFieldFormat(fieldName, result.value);
-                        if (!formatVal.valid) {
-                            console.warn(`[Reconciliation] Rejected invalid format for reconciled field "${fieldName}": "${result.value}" (${formatVal.reason})`);
-                            continue;
-                        }
-
-                        if (reconField) {
-                            reconField.status = 'reconciled_gemini';
-                            reconField.resolvedValue = result.value;
-                            reconField.geminiReasoning = result.reasoning;
-                            reconField.reconciledFrom = fieldsNeedingGemini[fieldName];
-                        }
-                        
-                        // Apply the reconciled value using generic dot-path setter (Issue 6)
-                        // Rule 4 guard: Statutory fields are strictly deterministic and never overwritten by Gemini.
-                        const STATUTORY_DETERMINISTIC_FIELDS = new Set([
-                            'mrp',
-                            'unitSalePrice',
-                            'netQuantity',
-                            'dates.manufacture',
-                            'dates.expiry',
-                            'dates.bestBefore',
-                            'batchNumber',
-                            'fssaiLicenseNumber',
-                            'servingsPerContainer',
-                            'servingSize',
-                            'ingredients',
-                            'nutritionFacts'
-                        ]);
-
-                        if (!STATUTORY_DETERMINISTIC_FIELDS.has(fieldName)) {
-                            setNestedField(merged, fieldName, result.value);
-                            const declKey = fieldName.split('.')[0];
-                            if (merged.declarations && merged.declarations[declKey]) {
-                                if (fieldName.includes('.')) {
-                                    const sub = fieldName.split('.')[1];
-                                    if (typeof merged.declarations[declKey].value === 'object' && merged.declarations[declKey].value) {
-                                        merged.declarations[declKey].value[sub] = result.value;
-                                    }
-                                } else {
-                                    merged.declarations[declKey].value = result.value;
-                                }
-                                merged.declarations[declKey].status = 'verified';
-                                merged.declarations[declKey].source = (declKey === 'genericCommodityName') ? 'llm_inferred' : 'gemini_reconciliation';
-                            }
-                        }
-                        
-                        console.log(`[Reconciliation] ${fieldName}: Gemini reconciled to "${result.value}" — ${result.reasoning}`);
-                    }
-                }
-            }
-
-            // Section 1 & 3: Apply brand classification with confidence-based overwrite policy
-            // Per Issue 7.2: field-level check avoids redundant outer gptOss gate
-            if (geminiResult.brandClassification) {
-                const bc = geminiResult.brandClassification;
-                
-                const canOverwriteIdentity = (fieldKey, currentVal) => {
-                    if ((merged.reconciliation?.gptOssResolvedFields || []).includes(fieldKey)) return false;
-                    const decl = merged.declarations?.[fieldKey];
-                    if (decl?.source === 'gpt_oss_120b') return false;
-                    if (!currentVal) return true;
-                    if (isDateShaped(currentVal)) return true;
-                    if (!decl || decl.status !== 'verified') return true;
-                    if (decl.confidence !== undefined && decl.confidence < 0.85) return true;
-                    if (merged.conflicts?.some(c => c.field === fieldKey)) return true;
-                    // If brandName matches marketer name or is an obvious badge, allow overwrite
-                    if (fieldKey === 'brandName' && merged.marketer?.name &&
-                        String(currentVal).toLowerCase().includes(String(merged.marketer.name).toLowerCase())) {
-                        return true;
-                    }
-                    // For heuristic extractions from first pass, allow Gemini classification to refine
-                    if (decl.source !== 'gemini_reconciliation') return true;
-                    return false;
-                };
-
-                if (bc.brand && canOverwriteIdentity('brandName', merged.brandName)) {
-                    const validation = validateFieldFormat('brandName', bc.brand);
-                    if (validation.valid) {
-                        console.log(`[Reconciliation] Verified/overwriting brandName: "${merged.brandName}" -> "${bc.brand}" via Gemini classification`);
-                        merged.brandName = bc.brand;
-                        if (!merged.declarations.brandName) merged.declarations.brandName = { value: null };
-                        merged.declarations.brandName.value = bc.brand;
-                        merged.declarations.brandName.source = 'gemini_reconciliation';
-                        merged.declarations.brandName.aiAssisted = true;
-                        merged.declarations.brandName.status = 'ai_assisted';
-                    } else {
-                        console.warn(`[Reconciliation] Format check rejected Gemini brandName: "${bc.brand}" (${validation.reason})`);
-                    }
-                }
-
-                if (bc.productName && canOverwriteIdentity('productName', merged.productName)) {
-                    const validation = validateFieldFormat('productName', bc.productName);
-                    if (validation.valid) {
-                        console.log(`[Reconciliation] Verified/overwriting productName: "${merged.productName}" -> "${bc.productName}" via Gemini classification`);
-                        merged.productName = bc.productName;
-                        if (!merged.declarations.productName) merged.declarations.productName = { value: null };
-                        merged.declarations.productName.value = bc.productName;
-                        merged.declarations.productName.source = 'gemini_reconciliation';
-                        merged.declarations.productName.aiAssisted = true;
-                        merged.declarations.productName.status = 'ai_assisted';
-                    } else {
-                        console.warn(`[Reconciliation] Format check rejected Gemini productName: "${bc.productName}" (${validation.reason})`);
-                    }
-                }
-
-                if (bc.genericName && canOverwriteIdentity('genericCommodityName', merged.genericCommodityName)) {
-                    const validation = validateFieldFormat('genericCommodityName', bc.genericName);
-                    if (validation.valid) {
-                        console.log(`[Reconciliation] Verified/overwriting genericCommodityName: "${merged.genericCommodityName}" -> "${bc.genericName}" via Gemini classification`);
-                        merged.genericCommodityName = bc.genericName;
-                        if (!merged.declarations.genericCommodityName) merged.declarations.genericCommodityName = { value: null };
-                        merged.declarations.genericCommodityName.value = bc.genericName;
-                        merged.declarations.genericCommodityName.source = 'llm_inferred';
-                        merged.declarations.genericCommodityName.aiAssisted = true;
-                        merged.declarations.genericCommodityName.status = 'ai_assisted';
-                    } else {
-                        console.warn(`[Reconciliation] Format check rejected Gemini genericCommodityName: "${bc.genericName}" (${validation.reason})`);
-                    }
-                }
-                
-                console.log(`[Reconciliation] Brand classification applied: brand="${merged.brandName}", product="${merged.productName}", generic="${merged.genericCommodityName}"`);
-            }
-        } catch (err) {
-            console.error('[Reconciliation] Gemini reconciliation failed:', err.message);
-            // Fallback: mark conflicting pending fields as unresolved conflicts
-            for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
-                if (candidates.length > 1) {
-                    const reconField = merged.reconciliation.fields[fieldName];
-                    if (reconField) reconField.status = 'unresolved_conflict';
-                    
-                    const conflictRecord = {
-                        field: fieldName,
-                        detectedValues: candidates.map(c => ({
-                            photo: c.photoId,
-                            value: c.value
-                        })),
-                        message: `Unresolved: different values detected across photos (Gemini unavailable)`,
-                        confirmedByGemini: false
-                    };
-                    merged.conflicts.push(conflictRecord);
-                    merged.reconciliation.conflicts.push(conflictRecord);
-                }
-            }
-        }
-    } else if (Object.keys(fieldsNeedingGemini).length > 0) {
-        console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) eligible for verification but Gemini is not available`);
-        for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
-            if (candidates.length > 1) {
-                const reconField = merged.reconciliation.fields[fieldName];
-                if (reconField) reconField.status = 'unresolved_conflict';
-                
-                const conflictRecord = {
-                    field: fieldName,
-                    detectedValues: candidates.map(c => ({
-                        photo: c.photoId,
-                        value: c.value
-                    })),
-                    message: `Different values detected across photos (Gemini not configured)`,
-                    confirmedByGemini: false
-                };
-                merged.conflicts.push(conflictRecord);
-                merged.reconciliation.conflicts.push(conflictRecord);
-            }
-        }
-    }
-
-    // Safety check for identity collision without semantic resolution:
-    // If an identity collision was detected in any input photo, and neither GPT-OSS
-    // nor live Gemini semantically verified/classified the identity fields, do not
-    // silently preserve the potentially swapped heuristic identity values.
-    if (extractedList.some(e => e.identityCollisionResolved)) {
-        const gptOssResolved = merged.reconciliation?.gptOssResolvedFields || [];
-        const hasLiveGeminiClassification = Boolean(
-            merged.reconciliation?.geminiUsed &&
-            !geminiResult?.skipped &&
-            !geminiResult?.isLocalFallback &&
-            geminiResult?.brandClassification?.brand &&
-            geminiResult?.brandClassification?.productName
-        );
-
-        ['productName', 'brandName'].forEach(idField => {
-            const resolvedByGptOss = gptOssResolved.includes(idField);
-            const resolvedByGemini = hasLiveGeminiClassification && (
-                geminiResult?.reconciledFields?.[idField]?.value &&
-                !geminiResult?.reconciledFields?.[idField]?.isConflict
-            );
-
-            if (!resolvedByGptOss && !resolvedByGemini) {
-                console.warn(`[Reconciliation] Identity collision for "${idField}" unresolved by AI arbitration — resetting to not_detected`);
-                merged[idField] = null;
-                if (!merged.declarations[idField]) {
-                    merged.declarations[idField] = createEvidenceRecord(null, null, 'not_detected');
-                } else {
-                    merged.declarations[idField].value = null;
-                    merged.declarations[idField].status = 'not_detected';
-                }
-                if (merged.validation) {
-                    merged.validation[idField] = {
-                        status: 'not_detected',
-                        reason: 'Unresolved brand/product identity collision without reliable semantic verification'
-                    };
-                }
-                if (merged.reconciliation?.fields?.[idField]) {
-                    merged.reconciliation.fields[idField].status = 'unresolved_collision';
-                    merged.reconciliation.fields[idField].resolvedValue = null;
-                }
-            }
-        });
-    }
-
-    merged.normalizedFields = { ...merged };
-
-    // Phase 5 Fix 2: Auto-apply Gemini visual fallback if imageBuffers were provided
-    if (imageBuffers && imageBuffers.length > 0) {
-        return await applyGeminiFallback(merged, imageBuffers);
-    }
-
-    return merged;
 };
 
 /**
- * Phase 5 Fix 2: Apply Gemini fallback for low-confidence/undetected fields.
- * Called AFTER merge, on the final merged result, with original image buffers.
- * 
- * Any field recovered here is tagged with:
- *   source: "gemini_fallback"
- *   aiAssisted: true
- * 
- * @param {Object} mergedFields - The merged extraction result
- * @param {Array<{buffer: Buffer, mimetype: string}>} images - Original uploaded images
- * @returns {Promise<Object>} Updated mergedFields with fallback values applied
+ * Consolidates multiple photo extractions into a single structured packaging record.
+ * Executes unified structuring through structuringEngine (GPT-OSS), falling back
+ * gracefully to deterministic regex extraction if GPT-OSS is unavailable.
+ *
+ * @param {Array<Object>} singlePhotoExtractions - Evidence packages from extractFields.
+ * @param {Array<Object>} imageFiles - Optional uploaded file references.
+ * @returns {Promise<Object>} Canonical packaged product scan record for ruleEngine.
  */
-const applyGeminiFallback = async (mergedFields, images = []) => {
-    try {
-        if (!geminiService.isAvailable() || images.length === 0) {
-            return mergedFields;
-        }
-
-    // Collect all low-confidence fields across all photos
-    const allLowConf = new Set();
-    if (Array.isArray(mergedFields._singleExtractions)) {
-        mergedFields._singleExtractions.forEach(ext => {
-            if (Array.isArray(ext.lowConfidenceFields)) {
-                ext.lowConfidenceFields.forEach(f => allLowConf.add(f));
-            }
-        });
+const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], imageFiles = []) => {
+    if (!Array.isArray(singlePhotoExtractions) || singlePhotoExtractions.length === 0) {
+        return extractFields([]);
     }
-    
-    // Also check merged result for not_detected, low-confidence, or unverified fields (Findings 3 & 4)
-    const fieldsToCheck = [
-        { name: 'productName', val: mergedFields.productName },
-        { name: 'brandName', val: mergedFields.brandName },
-        { name: 'genericCommodityName', val: mergedFields.genericCommodityName },
-        { name: 'mrp', val: mergedFields.mrp?.value },
-        { name: 'unitSalePrice', val: mergedFields.unitSalePrice },
-        { name: 'netQuantity', val: mergedFields.netQuantity?.value },
-        { name: 'manufacturer.name', val: mergedFields.manufacturer?.name },
-        { name: 'manufacturer.address', val: mergedFields.manufacturer?.address },
-        { name: 'marketer.name', val: mergedFields.marketer?.name },
-        { name: 'countryOfOrigin', val: mergedFields.countryOfOrigin },
-        { name: 'consumerCare.phone', val: mergedFields.consumerCare?.phone },
-        { name: 'consumerCare.email', val: mergedFields.consumerCare?.email },
-    ];
-    
-    fieldsToCheck.forEach(({ name, val }) => {
-        // If GPT-OSS 120B actually resolved this identity field, skip Gemini image fallback for it
-        if ((name === 'productName' || name === 'brandName' || name === 'genericCommodityName') && 
-            (mergedFields.reconciliation?.gptOssResolvedFields || []).includes(name)) {
-            return;
-        }
-        const declKey = name.split('.')[0];
-        const decl = mergedFields.declarations?.[declKey];
-        const isUnverified = !decl || decl.status !== 'verified';
-        const isLowConfidence = typeof decl?.confidence === 'number' && decl.confidence < 0.85;
-        if (!val || isUnverified || isLowConfidence) {
-            allLowConf.add(name);
+
+    const photoRowsList = singlePhotoExtractions.map((ext, idx) => ({
+        photoId: ext.sourceImageId || `photo-${idx + 1}`,
+        rows: ext._structuredRowsObj?.rows || (Array.isArray(ext.structuredRows) ? ext.structuredRows : [])
+    }));
+
+    const deterministicHints = [];
+    singlePhotoExtractions.forEach(ext => {
+        if (Array.isArray(ext.candidateHints)) {
+            deterministicHints.push(...ext.candidateHints);
         }
     });
 
-    const fieldsToRead = Array.from(allLowConf);
-    if (fieldsToRead.length === 0) {
-        return mergedFields;
+    const combinedRawOcr = [];
+    singlePhotoExtractions.forEach(ext => {
+        if (Array.isArray(ext.rawOcrText)) {
+            combinedRawOcr.push(...ext.rawOcrText);
+        }
+    });
+
+    // Attempt unified structuring via structuringEngine (GPT-OSS)
+    const structureResult = await structuringEngine.structureFields(photoRowsList, deterministicHints);
+
+    if (structureResult.success) {
+        const normalizedFields = {
+            ...structureResult.normalizedFields,
+            rawOcrText: combinedRawOcr
+        };
+
+        return {
+            ...normalizedFields,
+            declarations: structureResult.declarations,
+            validation: structureResult.validation,
+            photoCount: singlePhotoExtractions.length,
+            conflicts: [],
+            reconciliation: {
+                fields: {},
+                conflicts: [],
+                gptOssUsed: true
+            },
+            normalizedFields
+        };
     }
 
-    console.log(`[Gemini Fallback] Attempting to recover ${fieldsToRead.length} field(s):`, fieldsToRead);
+    // Degraded Fallback Mode: Execute deterministic extraction per photo
+    console.warn(`[Extraction] GPT-OSS structuring unavailable (${structureResult.reason || structureResult.error}) — falling back to deterministic extractor.`);
 
-    // Apply recovered values with AI-assisted provenance and confidence-based overwrite
-    let recoveredCount = 0;
-    const applyFallback = (fieldPath, value, reasoning, sourcePhrase) => {
-        const parts = fieldPath.split('.');
-        let target = mergedFields;
-        for (let i = 0; i < parts.length - 1; i++) {
-            if (!target[parts[i]]) target[parts[i]] = {};
-            target = target[parts[i]];
-        }
-        const lastKey = parts[parts.length - 1];
-        
-        const currentVal = target[lastKey];
-        const isFalsy = currentVal === null || currentVal === undefined || currentVal === '';
-        const isLowConf = allLowConf.has(fieldPath) || allLowConf.has(parts[0]);
-        const declKey = parts[0];
-        const decl = mergedFields.declarations?.[declKey];
-        const isUnverifiedDecl = !decl || decl.status !== 'verified';
-        const isConflict = mergedFields.conflicts?.some(c => c.field === fieldPath || c.field === declKey);
+    const fallbackSingleExtractions = singlePhotoExtractions.map((ext, idx) => {
+        const rawElements = ext._structuredRowsObj?.orderedElements || ext.rawOcrText || [];
+        const sRows = ext._structuredRowsObj || { rows: ext.structuredRows || [] };
+        const dims = { imageWidth: ext.imageWidth, imageHeight: ext.imageHeight };
+        const photoId = ext.sourceImageId || `photo-${idx + 1}`;
+        const detExt = (rawElements.length > 0 || (sRows.rows && sRows.rows.length > 0))
+            ? extractFieldsDeterministic(rawElements, sRows, dims, photoId)
+            : { normalizedFields: {}, declarations: {}, validation: {} };
 
-        // Shape/type validation gate
-        const formatCheck = validateFieldFormat(fieldPath, value);
-        if (!formatCheck.valid) {
-            console.warn(`[Gemini Fallback] Rejected invalid format for "${fieldPath}": "${value}" (${formatCheck.reason})`);
-            return;
-        }
+        const detNorm = detExt.normalizedFields || {};
+        const extNorm = ext.normalizedFields || {};
+        const mergedNorm = { ...detNorm };
 
-        // Strict protection: Never overwrite GPT-OSS 120B arbitrated fields with Gemini fallback
-        if (decl?.source === 'gpt_oss_120b' || 
-            ((fieldPath === 'productName' || fieldPath === 'brandName' || fieldPath === 'genericCommodityName') &&
-             (mergedFields.reconciliation?.gptOssResolvedFields || []).includes(fieldPath))) {
-            return;
-        }
-
-        // Overwrite policy: allow if falsy, low-confidence, unverified, in conflict, or date-shaped rejection
-        if (isFalsy || isLowConf || isUnverifiedDecl || isConflict || isDateShaped(currentVal)) {
-            // Grounding check for visual fallback
-            let isGrounded = true;
-            if (sourcePhrase && typeof sourcePhrase === 'string' && sourcePhrase.trim().length > 0) {
-                const normPhrase = sourcePhrase.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-                const allOcrText = (mergedFields.rawOcrText || []).map(r => r.text).join(' ').toLowerCase();
-                const words = normPhrase.split(/\s+/).filter(w => w.length > 2);
-                if (words.length > 0) {
-                    const matched = words.filter(w => allOcrText.includes(w));
-                    if (matched.length === 0) {
-                        console.warn(`[Gemini Fallback] Grounding check: sourcePhrase "${sourcePhrase}" for "${fieldPath}" not detected in OCR text`);
-                        isGrounded = false;
-                    }
+        // Overlay any explicit non-null values from ext/extNorm (e.g. mock test objects)
+        for (const [key, val] of Object.entries(extNorm)) {
+            if (val !== null && val !== undefined) {
+                if (typeof val === 'object' && !Array.isArray(val) && val.value !== null && val.value !== undefined) {
+                    mergedNorm[key] = val;
+                } else if (typeof val !== 'object' && val !== '') {
+                    mergedNorm[key] = val;
                 }
             }
-
-            if (fieldPath === 'mrp') {
-                const numVal = parseFloat(String(value).replace(/[^0-9.]/g, ''));
-                if (!isNaN(numVal) && numVal > 0 && numVal < 1000000) {
-                    mergedFields.mrp = {
-                        value: numVal,
-                        currency: 'INR',
-                        inclusiveOfTaxes: reasoning ? /incl/i.test(reasoning) : true
-                    };
-                }
-            } else if (fieldPath === 'netQuantity') {
-                const nqm = String(value).match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-                if (nqm && isValidQuantityUnit(nqm[2])) {
-                    mergedFields.netQuantity = {
-                        value: parseFloat(nqm[1]),
-                        unit: nqm[2].toLowerCase()
-                    };
-                }
-            } else {
-                target[lastKey] = value;
-            }
-            recoveredCount++;
-
-            // Ensure declarations are updated in sync (Single Source of Truth)
-            if (!mergedFields.declarations) mergedFields.declarations = {};
-            if (!mergedFields.declarations[declKey]) {
-                mergedFields.declarations[declKey] = { value: null };
-            }
-            const d = mergedFields.declarations[declKey];
-            if (parts.length > 1) {
-                if (!d.value || typeof d.value !== 'object') d.value = {};
-                d.value[lastKey] = value;
-            } else {
-                d.value = value;
-            }
-            d.source = (declKey === 'genericCommodityName') ? 'llm_inferred' : 'gemini_fallback';
-            d.aiAssisted = true;
-            d.status = isGrounded ? 'ai_assisted' : 'unverified';
-            d.needsReview = !isGrounded;
-
-            console.log(`[Gemini Fallback] Recovered ${fieldPath}: "${value}" (grounded=${isGrounded}) — ${reasoning}`);
-        } else {
-            console.log(`[Gemini Fallback] Preserved confident primary extraction for ${fieldPath}: "${currentVal}" (Gemini suggested "${value}")`);
         }
+        for (const [key, val] of Object.entries(ext)) {
+            if (['structuredRows', '_structuredRowsObj', 'candidateHints', 'rawOcrText', 'imageWidth', 'imageHeight', 'sourceImageId', 'declarations', 'validation', 'normalizedFields'].includes(key)) continue;
+            if (val !== null && val !== undefined) {
+                if (typeof val === 'object' && !Array.isArray(val) && val.value !== null && val.value !== undefined) {
+                    mergedNorm[key] = val;
+                } else if (typeof val !== 'object' && val !== '') {
+                    mergedNorm[key] = val;
+                }
+            }
+        }
+
+        return {
+            ...detExt,
+            ...mergedNorm,
+            normalizedFields: mergedNorm,
+            declarations: { ...(detExt.declarations || {}), ...(ext.declarations || {}) },
+            validation: { ...(detExt.validation || {}), ...(ext.validation || {}) }
+        };
+    });
+
+    // Merge with simple first non-null rule
+    const mergedNormalized = {
+        productName: null,
+        brandName: null,
+        genericCommodityName: null,
+        batchNumber: null,
+        fssaiLicenseNumber: null,
+        manufacturer: { name: null, address: null },
+        packer: { name: null, address: null },
+        importer: { name: null, address: null },
+        marketer: { name: null, address: null },
+        netQuantity: { value: null, unit: null },
+        servingsPerContainer: null,
+        servingSize: null,
+        mrp: { value: null, currency: 'INR', inclusiveOfTaxes: null },
+        dates: { manufacture: null, expiry: null, bestBefore: null },
+        consumerCare: { name: null, address: null, phone: null, email: null },
+        countryOfOrigin: null,
+        unitSalePrice: null,
+        dimensions: null,
+        ingredients: null,
+        nutritionFacts: {
+            calories: null, fat: null, sugar: null, protein: null,
+            sodium: null, carbohydrates: null, fiber: null
+        },
+        rawOcrText: combinedRawOcr,
+        structuringMode: 'deterministic_fallback'
     };
 
-    // Try images to recover fields
-    const allRecovered = {};
-    for (let imgIdx = 0; imgIdx < Math.min(images.length, 3); imgIdx++) {
-        const remainingFields = fieldsToRead.filter(f => !allRecovered[f]);
-        if (remainingFields.length === 0) break;
+    const mergedDeclarations = {};
+    const mergedValidation = {};
 
-        const currentImage = images[imgIdx];
-        try {
-            const fallbackResult = await geminiService.fallbackReadFields(
-                currentImage.buffer,
-                remainingFields,
-                currentImage.mimetype || 'image/jpeg'
-            );
+    for (const ext of fallbackSingleExtractions) {
+        const f = ext.normalizedFields || ext;
+        if (!mergedNormalized.productName && f.productName) mergedNormalized.productName = f.productName;
+        if (!mergedNormalized.brandName && f.brandName) mergedNormalized.brandName = f.brandName;
+        if (!mergedNormalized.genericCommodityName && f.genericCommodityName) mergedNormalized.genericCommodityName = f.genericCommodityName;
+        if (!mergedNormalized.batchNumber && f.batchNumber) mergedNormalized.batchNumber = f.batchNumber;
+        if (!mergedNormalized.fssaiLicenseNumber && f.fssaiLicenseNumber) mergedNormalized.fssaiLicenseNumber = f.fssaiLicenseNumber;
+        if (!mergedNormalized.countryOfOrigin && f.countryOfOrigin) mergedNormalized.countryOfOrigin = f.countryOfOrigin;
+        if (!mergedNormalized.unitSalePrice && f.unitSalePrice) mergedNormalized.unitSalePrice = f.unitSalePrice;
+        if (!mergedNormalized.ingredients && f.ingredients) mergedNormalized.ingredients = f.ingredients;
+        if (!mergedNormalized.servingsPerContainer && f.servingsPerContainer) mergedNormalized.servingsPerContainer = f.servingsPerContainer;
+        if (!mergedNormalized.servingSize && f.servingSize) mergedNormalized.servingSize = f.servingSize;
 
-            if (!fallbackResult.skipped && fallbackResult.results) {
-                for (const [field, data] of Object.entries(fallbackResult.results)) {
-                    const validated = validateGeminiFieldResult(field, data);
-                    if (validated) {
-                        applyFallback(field, validated.value, validated.reasoning, data.sourcePhrase);
-                        allRecovered[field] = validated;
-                    } else {
-                        console.warn(`[Gemini Fallback] Rejected invalid result for "${field}":`, JSON.stringify(data));
-                    }
+        if (!mergedNormalized.netQuantity.value && f.netQuantity?.value) {
+            mergedNormalized.netQuantity = { ...f.netQuantity };
+        }
+        if (!mergedNormalized.mrp.value && f.mrp?.value) {
+            mergedNormalized.mrp = { ...f.mrp };
+        }
+        if (!mergedNormalized.dates.manufacture && f.dates?.manufacture) mergedNormalized.dates.manufacture = f.dates.manufacture;
+        if (!mergedNormalized.dates.expiry && f.dates?.expiry) mergedNormalized.dates.expiry = f.dates.expiry;
+        if (!mergedNormalized.dates.bestBefore && f.dates?.bestBefore) mergedNormalized.dates.bestBefore = f.dates.bestBefore;
+
+        if (!mergedNormalized.manufacturer.name && f.manufacturer?.name) mergedNormalized.manufacturer = { ...f.manufacturer };
+        if (!mergedNormalized.packer.name && f.packer?.name) mergedNormalized.packer = { ...f.packer };
+        if (!mergedNormalized.importer.name && f.importer?.name) mergedNormalized.importer = { ...f.importer };
+        if (!mergedNormalized.marketer.name && f.marketer?.name) mergedNormalized.marketer = { ...f.marketer };
+
+        if (!mergedNormalized.consumerCare.phone && f.consumerCare?.phone) mergedNormalized.consumerCare.phone = f.consumerCare.phone;
+        if (!mergedNormalized.consumerCare.email && f.consumerCare?.email) mergedNormalized.consumerCare.email = f.consumerCare.email;
+
+        if (f.nutritionFacts) {
+            for (const [k, v] of Object.entries(f.nutritionFacts)) {
+                if (mergedNormalized.nutritionFacts[k] === null && v !== null) {
+                    mergedNormalized.nutritionFacts[k] = v;
                 }
             }
-        } catch (imgErr) {
-            console.warn(`[Gemini Fallback] Error processing image #${imgIdx + 1}:`, imgErr.message);
+        }
+
+        if (ext.declarations) {
+            Object.entries(ext.declarations).forEach(([k, decl]) => {
+                if (!mergedDeclarations[k] || (decl && decl.status === 'verified' && mergedDeclarations[k].status !== 'verified')) {
+                    mergedDeclarations[k] = { ...decl };
+                }
+            });
+        }
+        if (ext.validation) {
+            Object.entries(ext.validation).forEach(([k, v]) => {
+                if (!mergedValidation[k] || (v && v.status === 'verified' && mergedValidation[k].status !== 'verified')) {
+                    mergedValidation[k] = { ...v };
+                }
+            });
         }
     }
 
-    // Track fallback metadata
-    if (!mergedFields.geminiMetadata) mergedFields.geminiMetadata = {};
-    mergedFields.geminiMetadata.fallback = {
-        fieldsAttempted: fieldsToRead,
-        fieldsRecovered: Object.keys(allRecovered),
-        recoveredCount
+    mergedDeclarations.structuringMode = 'deterministic_fallback';
+
+    return {
+        ...mergedNormalized,
+        declarations: mergedDeclarations,
+        validation: mergedValidation,
+        photoCount: singlePhotoExtractions.length,
+        conflicts: [],
+        reconciliation: {
+            fields: {},
+            conflicts: [],
+            gptOssUsed: false,
+            structuringMode: 'deterministic_fallback'
+        },
+        normalizedFields: mergedNormalized
     };
+};
 
-    console.log(`[Gemini Fallback] Recovered ${recoveredCount} of ${fieldsToRead.length} fields across images`);
-
-    } catch (err) {
-        console.error('[Gemini Fallback] Error:', err.message);
-    }
-
+/**
+ * Deprecated Gemini fallback retained as a signature-compatible no-op for existing controllers.
+ */
+const applyGeminiFallback = async (mergedFields) => {
     return mergedFields;
 };
 
@@ -3044,11 +350,14 @@ module.exports = {
     groupIntoRows,
     generateCandidateTitles,
     extractFields,
+    extractFieldsDeterministic,
     mergeMultiPhotoExtractedFields,
     applyGeminiFallback,
     validateFieldFormat,
     isValidQuantityUnit,
     isDateShaped,
-    isNonProductTitleCandidate
+    isMarketingBadge,
+    isNonProductTitleCandidate,
+    sanitizeExtractedText,
+    KNOWN_COUNTRIES
 };
-

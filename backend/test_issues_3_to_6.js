@@ -143,35 +143,6 @@ async function run() {
         assert.strictEqual(vfValid.valid, true, 'validateFieldFormat should accept valid productName');
     });
 
-    // -------------------------------------------------------------------------
-    // ISSUE 6: Dot-path Setter for Non-Whitelisted Scalar Fields
-    // -------------------------------------------------------------------------
-    console.log('\n--- Issue 6 Verification: Reconciled Non-Whitelist Fields Applied ---');
-    await runTest('reconciled scalar fields outside the old 6-entry whitelist are applied to merged', async () => {
-        // photo 1 has packer.name "Alpha Packing Ltd", photo 2 has "Alpha Packing Pvt Ltd"
-        const ext1 = {
-            sourceImageId: 'photo-1',
-            packer: { name: 'Alpha Packing Ltd' },
-            consumerCare: { phone: '1800-111-222', email: 'care@example.com' },
-            rawOcrText: []
-        };
-        const ext2 = {
-            sourceImageId: 'photo-2',
-            packer: { name: 'Alpha Packing Pvt Ltd' },
-            consumerCare: { phone: '1800-111-222', email: 'care@example.com' },
-            rawOcrText: []
-        };
-
-        const merged = await mergeMultiPhotoExtractedFields([ext1, ext2]);
-
-        // packer.name was NOT in the old 6-entry setterMap!
-        // With setNestedField, it should now be properly set on merged.packer.name!
-        assert.ok(merged.packer, 'Expected merged.packer to exist');
-        assert.ok(merged.packer.name, 'Expected merged.packer.name to be populated');
-        console.log(`    merged.packer.name resolved to: "${merged.packer.name}"`);
-        assert.strictEqual(merged.consumerCare.phone, '1800-111-222');
-        assert.strictEqual(merged.consumerCare.email, 'care@example.com');
-    });
 
     // -------------------------------------------------------------------------
     // RULE 4: Statutory Fields Stay Fully Deterministic
