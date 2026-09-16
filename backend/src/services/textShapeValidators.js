@@ -266,6 +266,33 @@ const isExplicitCountryDeclaration = (text) => {
 };
 
 /**
+ * Extracts explicit country from a declaration string.
+ * Returns normalized country name if the string is an explicit country declaration
+ * (e.g. "Made in Germany" -> "Germany", "Country of Origin: Japan" -> "Japan").
+ * Returns null if the country is only part of an address, URL, email, or unrelated text.
+ */
+const extractExplicitCountryFromDeclaration = (text) => {
+    if (!text || typeof text !== 'string') return null;
+    const t = text.trim();
+    if (t.length < 3) return null;
+
+    // Reject email / web addresses immediately
+    if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(t)) return null;
+
+    const match = t.match(EXPLICIT_COUNTRY_PREFIX_REGEX);
+    if (!match || !match[1]) return null;
+
+    const candidate = match[1].trim();
+    for (const country of KNOWN_COUNTRIES) {
+        const countryPattern = new RegExp(`\\b${country}\\b`, 'i');
+        if (countryPattern.test(candidate)) {
+            return country === 'USA' ? 'United States' : country;
+        }
+    }
+    return null;
+};
+
+/**
  * Universal text sanitization helper to clean OCR noise, broken encodings,
  * mojibake (e.g. "â‚¹", "â€“"), and malformed characters such as "&þ" or isolated "þ".
  * If the resulting string has no real words or characters, returns null so clean
@@ -459,6 +486,7 @@ module.exports = {
     KNOWN_COUNTRIES,
     sanitizeExtractedText,
     isGenericCommodityTerm,
-    isExplicitCountryDeclaration
+    isExplicitCountryDeclaration,
+    extractExplicitCountryFromDeclaration
 };
 

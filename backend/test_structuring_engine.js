@@ -10,6 +10,8 @@
  * 6. Statutory field format check gates LLM output (invalid date downgraded to 'review', normalized is null)
  */
 
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 require('dotenv').config({ path: './.env' });
 const assert = require('assert');
 const structuringEngine = require('./src/services/structuringEngine');

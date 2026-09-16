@@ -16,6 +16,7 @@ const {
     sanitizeExtractedText,
     isGenericCommodityTerm,
     isExplicitCountryDeclaration,
+    extractExplicitCountryFromDeclaration,
     KNOWN_COUNTRIES
 } = require('./textShapeValidators');
 
@@ -27,6 +28,12 @@ evidence extracted from photos of a packaged product — organized by
 photo, then by row (a row is a set of text fragments the reconstruction
 layer determined are visually aligned on the same horizontal line or
 table row), then by cell within that row (left to right).
+
+Each visual row contains:
+- "rowId": stable integer identifying the visual row.
+- "cells": array of word cells with text, confidence, and normalized bounding box [minX, minY, maxX, maxY].
+- "normalizedBbox": overall row bounding box.
+- "sourceRefs": array of {"photoId", "rowId"} pairs identifying all original OCR rows supporting that canonical evidence across photo angles.
 
 Your job is to produce a single structured JSON object describing every
 field listed below. You are reading fragmented, possibly reordered,
@@ -58,7 +65,10 @@ you. For every field, return:
     "character_confusion_fix", "row_concatenation", "generic_classification",
     or null if no correction was applied. Do not use any other reason string.
   - "groundingRefs": an array of {"photoId", "rowId"} pairs identifying
-    every row your value/correction is based on.
+    every row your value/correction is based on. When a value is supported
+    by multiple photos (as indicated in sourceRefs or across photos), cite
+    all relevant {"photoId", "rowId"} references. Do not invent references.
+    Do not cite a row that does not contain the evidence.
   - "confidence": 0.0-1.0.
 If a field has no supporting evidence anywhere in the input, return
 "value": null with an empty "groundingRefs" — never guess, never
@@ -132,7 +142,8 @@ Respond with a single JSON object only, no prose.`;
 const buildRowContext = (photoRowsList = []) => {
     return photoRowsList.map(({ photoId, rows }) => ({
         photoId,
-        rows: (rows || []).map((row, rowId) => {
+        rows: (rows || []).map((row, rowIndex) => {
+            const stableRowId = row.rowId !== undefined ? row.rowId : rowIndex;
             const rawCells = Array.isArray(row.cells)
                 ? row.cells
                 : (Array.isArray(row.elements) && row.elements.length > 0)
@@ -164,10 +175,15 @@ const buildRowContext = (photoRowsList = []) => {
 
             const rowBbox = row.normalizedBbox || (Array.isArray(row.elements?.[0]?.bbox) ? [row.minX, row.minY, row.maxX, row.maxY] : []);
 
+            const sourceRefs = Array.isArray(row.sourceRefs) && row.sourceRefs.length > 0
+                ? row.sourceRefs
+                : [{ photoId, rowId: stableRowId }];
+
             return {
-                rowId,
+                rowId: stableRowId,
                 cells,
-                normalizedBbox: Array.isArray(rowBbox) ? rowBbox : []
+                normalizedBbox: Array.isArray(rowBbox) ? rowBbox : [],
+                sourceRefs
             };
         })
     }));
@@ -218,6 +234,88 @@ const stringifyValue = (val) => {
 };
 
 /**
+ * Normalizes text into clean lowercase linguistic/numeric tokens.
+ */
+const normalizeEvidenceTokens = (text = '') =>
+    String(text)
+        .toLowerCase()
+        .replace(/ingredients?\s*[:.-]?/gi, ' ')
+        .replace(/[^\p{L}\p{N}%]+/gu, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+
+/**
+ * Validates that proposed tokens are grounded in cited evidence rows
+ * using token multiplicity containment and ordered subsequence checks.
+ */
+const isTokenSequenceGrounded = (value, evidenceTexts = []) => {
+    const valTokens = normalizeEvidenceTokens(value);
+    if (valTokens.length === 0) {
+        return { valid: false, reason: 'Empty token sequence' };
+    }
+
+    const combinedEvidence = evidenceTexts.join(' ');
+    const evidenceTokens = normalizeEvidenceTokens(combinedEvidence);
+    if (evidenceTokens.length === 0) {
+        return { valid: false, reason: 'No evidence tokens found in cited rows' };
+    }
+
+    // 1. Token Multiplicity Containment (Frequency Map)
+    const evidenceFreq = new Map();
+    for (const tok of evidenceTokens) {
+        evidenceFreq.set(tok, (evidenceFreq.get(tok) || 0) + 1);
+    }
+
+    const missingTokens = [];
+    for (const tok of valTokens) {
+        const count = evidenceFreq.get(tok) || 0;
+        if (count <= 0) {
+            // Check if it's a minor OCR variant of an evidence token
+            const hasSimilar = evidenceTokens.some(eTok => {
+                if (Math.abs(eTok.length - tok.length) > 2) return false;
+                return levenshtein(eTok, tok) <= 1;
+            });
+            if (!hasSimilar) {
+                missingTokens.push(tok);
+            }
+        } else {
+            evidenceFreq.set(tok, count - 1);
+        }
+    }
+
+    if (missingTokens.length > 0) {
+        return {
+            valid: false,
+            reason: `Proposed text contains tokens not present in cited rows: ${missingTokens.slice(0, 5).join(', ')}`
+        };
+    }
+
+    // 2. Ordered Subsequence Check
+    let evIdx = 0;
+    let inOrderMatches = 0;
+    for (const vTok of valTokens) {
+        while (evIdx < evidenceTokens.length) {
+            const eTok = evidenceTokens[evIdx];
+            evIdx++;
+            if (eTok === vTok || (Math.abs(eTok.length - vTok.length) <= 1 && levenshtein(eTok, vTok) <= 1)) {
+                inOrderMatches++;
+                break;
+            }
+        }
+    }
+
+    const orderRatio = inOrderMatches / valTokens.length;
+    if (orderRatio < 0.70) {
+        return {
+            valid: false,
+            reason: `Proposed text violates the token order of cited rows (${Math.round(orderRatio * 100)}% ordered)`
+        };
+    }
+
+    return { valid: true };
+};
+
+/**
  * 3c. Deterministic grounding validator (no LLM — safety gate).
  * 
  * @param {string} fieldName - Canonical field key
@@ -239,19 +337,47 @@ const validateGrounding = (fieldName, decision, rowLookup, tier = 'strict') => {
     // Generic Commodity vs Brand Identity Separation
     if (fieldName === 'brandName') {
         if (isGenericCommodityTerm(value)) {
-            return { status: 'review', value: decision.value, reason: `Generic category/commodity descriptor cannot be brandName: "${value}"` };
+            return { status: 'review', value: null, reason: `Generic category/commodity descriptor cannot be brandName: "${value}"` };
         }
     }
 
     // Explicit Country of Origin Validation
     if (fieldName === 'countryOfOrigin') {
-        if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(value)) {
-            return { status: 'review', value: decision.value, reason: `Contains URL/email — not a valid country: "${value}"` };
+        const explicitCountries = refs
+            .map(ref => rowLookup.get(`${ref.photoId}:${ref.rowId}`) || '')
+            .map(extractExplicitCountryFromDeclaration)
+            .filter(Boolean);
+
+        if (explicitCountries.length === 0) {
+            return {
+                status: 'review',
+                value: decision.value,
+                reason: 'Country of origin requires explicit manufacturing/origin declaration evidence'
+            };
         }
+
+        const candidate = String(value).trim().toLowerCase();
+        const candidateMapped = candidate === 'usa' ? 'united states' : candidate;
+
+        const matched = explicitCountries.some(country => {
+            const normC = country.toLowerCase();
+            const normCMapped = normC === 'usa' ? 'united states' : normC;
+            return normCMapped === candidateMapped || normCMapped === candidate;
+        });
+
+        if (!matched) {
+            return {
+                status: 'review',
+                value: decision.value,
+                reason: 'Proposed country does not match explicit origin/manufacturing declaration'
+            };
+        }
+
         const countryCheck = validateFieldFormat('countryOfOrigin', value);
         if (!countryCheck.valid) {
             return { status: 'review', value: decision.value, reason: countryCheck.reason };
         }
+        return { status: 'verified', value: countryCheck.value, provenance: decision.correctionApplied ? 'ocr_corrected' : 'ocr_verbatim' };
     }
 
     // Ingredients Safety Validation
@@ -264,6 +390,22 @@ const validateGrounding = (fieldName, decision, rowLookup, tier = 'strict') => {
         if (/^(?:directions?\s*for\s*use|how\s*to\s*use|storage|store\s*in\s*a\s*cool|keep\s*out\s*of\s*reach)\b/i.test(lowerVal)) {
             return { status: 'review', value: decision.value, reason: `Storage or usage instructions cited as ingredients: "${value}"` };
         }
+
+        const evidenceTexts = refs.map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '').filter(Boolean);
+        if (evidenceTexts.length === 0) {
+            return { status: 'review', value: decision.value, reason: 'No cited row evidence found for ingredients' };
+        }
+
+        const tokenCheck = isTokenSequenceGrounded(value, evidenceTexts);
+        if (!tokenCheck.valid) {
+            return { status: 'review', value: decision.value, reason: tokenCheck.reason };
+        }
+
+        return {
+            status: 'verified',
+            value: decision.value,
+            provenance: refs.length > 1 || decision.correctionApplied ? 'ocr_corrected' : 'ocr_verbatim'
+        };
     }
 
     if (tier === 'generic_inferred') {
@@ -358,13 +500,24 @@ const validateGrounding = (fieldName, decision, rowLookup, tier = 'strict') => {
     }
 
     if (decision.correctionReason === 'row_concatenation') {
-        // The claimed value's characters should be a superset built from the cited rows' text.
-        const combined = refs.map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '').join('');
-        const combinedChars = combined.toLowerCase().replace(/[^a-z0-9]/g, '').split('').sort().join('');
-        const valueChars = value.toLowerCase().replace(/[^a-z0-9]/g, '').split('').sort().join('');
-        const missing = [...new Set(valueChars)].filter(c => !combinedChars.includes(c));
-        if (missing.length > 0) {
-            return { status: 'review', value: decision.value, reason: `Concatenation introduces characters not present in cited rows: ${missing.join('')}` };
+        const evidenceTexts = refs.map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '').filter(Boolean);
+        if (fieldName === 'ingredients') {
+            const tokenCheck = isTokenSequenceGrounded(value, evidenceTexts);
+            if (!tokenCheck.valid) {
+                return { status: 'review', value: decision.value, reason: tokenCheck.reason };
+            }
+        } else {
+            const tokenCheck = isTokenSequenceGrounded(value, evidenceTexts);
+            if (!tokenCheck.valid) {
+                // Character-level containment fallback for character-split text (e.g. ₹ 7 9 9)
+                const combined = evidenceTexts.join('');
+                const combinedChars = combined.toLowerCase().replace(/[^a-z0-9]/g, '').split('').sort().join('');
+                const valueChars = value.toLowerCase().replace(/[^a-z0-9]/g, '').split('').sort().join('');
+                const missing = [...new Set(valueChars)].filter(c => !combinedChars.includes(c));
+                if (missing.length > 0) {
+                    return { status: 'review', value: decision.value, reason: `Concatenation introduces characters not present in cited rows: ${missing.join('')}` };
+                }
+            }
         }
         if (tier === 'strict') {
             const fmtCheck = validateFieldFormat(fieldName, decision.value);
@@ -426,11 +579,23 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
 
     const rowLookup = new Map();
     photoRowsList.forEach(({ photoId, rows }) => {
-        (rows || []).forEach((row, rowId) => {
+        (rows || []).forEach((row, rowIndex) => {
+            const stableRowId = row.rowId !== undefined ? row.rowId : rowIndex;
             const text = (row.elements && row.elements.length > 0)
                 ? row.elements.map(e => e.text).join(' ')
                 : (row.text || '');
-            rowLookup.set(`${photoId}:${rowId}`, text);
+
+            // Map canonical row ID
+            rowLookup.set(`${photoId}:${stableRowId}`, text);
+
+            // Map all supporting source refs
+            const refs = Array.isArray(row.sourceRefs) && row.sourceRefs.length > 0
+                ? row.sourceRefs
+                : [{ photoId, rowId: stableRowId }];
+
+            refs.forEach(ref => {
+                rowLookup.set(`${ref.photoId}:${ref.rowId}`, text);
+            });
         });
     });
 

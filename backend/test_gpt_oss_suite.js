@@ -10,6 +10,8 @@
  * 6. Error, Timeout, and Missing Key Fallback Resilience
  */
 
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 require('dotenv').config({ path: './.env' });
 const assert = require('assert');
 const gptOssService = require('./src/services/gptOssService');

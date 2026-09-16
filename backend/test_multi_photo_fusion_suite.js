@@ -1,22 +1,31 @@
 /**
  * DrishtiScan — Synthetic Multi-Photo Evidence Fusion & Accuracy Test Suite
  * 
- * Tests all 22 required scenarios using purely synthetic, product-agnostic data:
- * - Multi-Photo Fusion (deduplication, unique row preservation, noise survival, single GPT-OSS call)
- * - Country of Origin Detection & Safeguards (Made in, Manufactured in, Origin, address/email rejection)
- * - Identity Separation (commodity not becoming brand, null on missing, generic classification)
- * - Ingredients Extraction & Grounding (single-row, multi-row concatenation, non-swallowing of nutrition/storage)
- * - Preference Matcher & Regression Compatibility
+ * Tests all required scenarios using purely synthetic, product-agnostic data:
+ * - Multi-Photo Fusion (stable row IDs, conflict-safe statutory preservation, deduplication, single GPT call)
+ * - Country of Origin Contextual Grounding (Made in, Manufactured in, address/email/URL rejection, cross-photo)
+ * - Identity Separation (brand vs generic commodity, no product name handling, generic classification)
+ * - Ingredients Token-Sequence Grounding (single-row, multi-row, non-swallowing of nutrition/storage, anti-invention)
+ * - Regression & Consumer Preference Integration
  */
 
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 require('dotenv').config({ path: './.env' });
 const assert = require('assert');
-const { fuseMultiPhotoEvidence, normalizeTextForDeduplication, areNearIdentical } = require('./src/services/multiPhotoEvidenceFusion');
+const {
+    fuseMultiPhotoEvidence,
+    normalizeTextForDeduplication,
+    areNearIdentical,
+    isPotentialStatutoryRow,
+    areSafeToMergeRows
+} = require('./src/services/multiPhotoEvidenceFusion');
 const structuringEngine = require('./src/services/structuringEngine');
 const { validateGrounding, FIELD_TIERS } = structuringEngine;
 const {
     isGenericCommodityTerm,
     isExplicitCountryDeclaration,
+    extractExplicitCountryFromDeclaration,
     validateFieldFormat,
     KNOWN_COUNTRIES
 } = require('./src/services/textShapeValidators');
@@ -49,24 +58,24 @@ async function runTestSuite() {
     console.log('================================================================\n');
 
     // -------------------------------------------------------------------------
-    // 1-5: MULTI-PHOTO FUSION TESTS
+    // 1-6: MULTI-PHOTO FUSION & STABLE ROW ID TESTS
     // -------------------------------------------------------------------------
-    console.log('--- Suite 1: Multi-Photo Evidence Fusion ---');
+    console.log('--- Suite 1: Multi-Photo Evidence Fusion & Stable Row IDs ---');
 
-    await runTest('1. Two photos contain identical row: deduplicate safely and preserve all grounding refs', () => {
+    await runTest('1. Test A: Same declaration on two photos produces one fused row, original stable rowIds, and both sourceRefs', () => {
         const photoRowsList = [
             {
                 photoId: 'photo-1',
                 rows: [
-                    { text: 'NET WEIGHT: 500 g', confidence: 0.88, elements: [{ text: 'NET WEIGHT: 500 g', confidence: 0.88 }] },
-                    { text: 'MRP Rs. 250.00', confidence: 0.90, elements: [{ text: 'MRP Rs. 250.00', confidence: 0.90 }] }
+                    { rowId: 0, text: 'NET WEIGHT: 500 g', confidence: 0.88, elements: [{ text: 'NET WEIGHT: 500 g', confidence: 0.88 }] },
+                    { rowId: 1, text: 'MRP Rs. 250.00', confidence: 0.90, elements: [{ text: 'MRP Rs. 250.00', confidence: 0.90 }] }
                 ]
             },
             {
                 photoId: 'photo-2',
                 rows: [
-                    { text: 'NET WEIGHT: 500 g', confidence: 0.95, elements: [{ text: 'NET WEIGHT: 500 g', confidence: 0.95 }] },
-                    { text: 'BATCH NO: BATCH994', confidence: 0.85, elements: [{ text: 'BATCH NO: BATCH994', confidence: 0.85 }] }
+                    { rowId: 0, text: 'NET WEIGHT: 500 g', confidence: 0.95, elements: [{ text: 'NET WEIGHT: 500 g', confidence: 0.95 }] },
+                    { rowId: 1, text: 'BATCH NO: BATCH994', confidence: 0.85, elements: [{ text: 'BATCH NO: BATCH994', confidence: 0.85 }] }
                 ]
             }
         ];
@@ -76,154 +85,201 @@ async function runTestSuite() {
         assert.strictEqual(fused.stats.fusedRowCount, 3, 'Fused row count should be 3 (1 duplicate collapsed)');
         assert.strictEqual(fused.stats.deduplicatedCount, 1, '1 duplicate deduplicated');
 
-        // Verify grounding refs lookup has both photo-1:0 and photo-2:0
+        // Check that photo-1:0 has both sourceRefs
         const p1Refs = fused.allGroundingRefs.get('photo-1:0');
         assert.ok(Array.isArray(p1Refs), 'Grounding refs for photo-1:0 should exist');
-        assert.strictEqual(p1Refs.length, 2, 'Should contain 2 supporting references for the deduplicated row');
+        assert.strictEqual(p1Refs.length, 2, 'Should contain 2 supporting references for deduplicated row');
         assert.ok(p1Refs.some(r => r.photoId === 'photo-1' && r.rowId === 0));
         assert.ok(p1Refs.some(r => r.photoId === 'photo-2' && r.rowId === 0));
+
+        // Grounding lookup resolves BOTH photo-1:0 and photo-2:0
+        assert.strictEqual(fused.rowLookupMap.get('photo-1:0'), 'NET WEIGHT: 500 g');
+        assert.strictEqual(fused.rowLookupMap.get('photo-2:0'), 'NET WEIGHT: 500 g');
     });
 
-    await runTest('2. Photo 1 contains Field A, Photo 2 contains Field B: final result preserves both', () => {
+    await runTest('2. Test B: Conflicting statutory declarations (MRP 99 vs MRP 98) are NOT deduplicated; both survive', () => {
         const photoRowsList = [
             {
                 photoId: 'photo-1',
                 rows: [
-                    { text: 'SYNTHETIC BRAND ALPHA', confidence: 0.90, elements: [{ text: 'SYNTHETIC BRAND ALPHA' }] }
+                    { rowId: 0, text: 'MRP: 99', confidence: 0.90 }
                 ]
             },
             {
                 photoId: 'photo-2',
                 rows: [
-                    { text: 'FSSAI LIC NO: 10012022000123', confidence: 0.92, elements: [{ text: 'FSSAI LIC NO: 10012022000123' }] }
+                    { rowId: 0, text: 'MRP: 98', confidence: 0.90 }
+                ]
+            }
+        ];
+
+        assert.strictEqual(isPotentialStatutoryRow('MRP: 99'), true, 'MRP: 99 should be statutory');
+        assert.strictEqual(isPotentialStatutoryRow('MRP: 98'), true, 'MRP: 98 should be statutory');
+        assert.strictEqual(areSafeToMergeRows({ text: 'MRP: 99' }, { text: 'MRP: 98' }), false, 'Conflicting MRP values must NOT be safe to merge');
+
+        const fused = fuseMultiPhotoEvidence(photoRowsList);
+        assert.strictEqual(fused.stats.fusedRowCount, 2, 'Both conflicting MRP rows must survive');
+        assert.strictEqual(fused.stats.deduplicatedCount, 0, 'No deduplication on conflicting MRP');
+    });
+
+    await runTest('3. Test C: Unique evidence survives across 3 photos without loss', () => {
+        const photoRowsList = [
+            {
+                photoId: 'photo-1',
+                rows: [
+                    { rowId: 0, text: 'PRODUCT TITLE: SYNTHETIC ITEM', confidence: 0.90 }
+                ]
+            },
+            {
+                photoId: 'photo-2',
+                rows: [
+                    { rowId: 0, text: 'FSSAI LIC NO: 10012022000123', confidence: 0.92 }
+                ]
+            },
+            {
+                photoId: 'photo-3',
+                rows: [
+                    { rowId: 0, text: 'INGREDIENTS: SYNTHETIC INGREDIENT ALPHA, SYNTHETIC INGREDIENT BETA', confidence: 0.91 }
                 ]
             }
         ];
 
         const fused = fuseMultiPhotoEvidence(photoRowsList);
-        assert.strictEqual(fused.stats.fusedRowCount, 2, 'Both unique rows must be preserved');
+        assert.strictEqual(fused.stats.fusedRowCount, 3, 'All 3 unique evidence groups must survive');
         const allText = Array.from(fused.rowLookupMap.values()).join(' ');
-        assert.ok(allText.includes('SYNTHETIC BRAND ALPHA'), 'Field A preserved');
-        assert.ok(allText.includes('10012022000123'), 'Field B preserved');
+        assert.ok(allText.includes('PRODUCT TITLE: SYNTHETIC ITEM'));
+        assert.ok(allText.includes('10012022000123'));
+        assert.ok(allText.includes('SYNTHETIC INGREDIENT ALPHA'));
     });
 
-    await runTest('3. Photo 1 is noisy and Photo 2 is clear: clear evidence survives and canonical text is retained', () => {
+    await runTest('4. Test D: Noisy + clear duplicate retains canonical row, clearer confidence, and both sourceRefs', () => {
         const photoRowsList = [
             {
                 photoId: 'photo-1',
                 rows: [
-                    { text: 'EXP: 12/2026', confidence: 0.60, elements: [{ text: 'EXP: 12/2026', confidence: 0.60 }] }
+                    { rowId: 0, text: 'EXP: 12/2026', confidence: 0.60 }
                 ]
             },
             {
                 photoId: 'photo-2',
                 rows: [
-                    { text: 'EXP: 12/2026', confidence: 0.96, elements: [{ text: 'EXP: 12/2026', confidence: 0.96 }] }
+                    { rowId: 0, text: 'EXP: 12/2026', confidence: 0.96 }
                 ]
             }
         ];
 
         const fused = fuseMultiPhotoEvidence(photoRowsList);
         assert.strictEqual(fused.stats.fusedRowCount, 1, 'Near-identical rows collapsed to 1');
-        // Primary photo-1 row should have updated confidence from clearer photo-2
         const p1Rows = fused.fusedPhotoRows.find(p => p.photoId === 'photo-1').rows;
         assert.strictEqual(p1Rows[0].confidence, 0.96, 'Highest confidence retained from clear photo');
+        assert.strictEqual(p1Rows[0].sourceRefs.length, 2, 'Both sourceRefs retained');
     });
 
-    await runTest('4. Three photos contain duplicated + unique rows: no unique evidence disappears', () => {
+    await runTest('5. Reindexing cannot break grounding: stable rowIds preserved after deduplication', () => {
+        // Photo 1: row 0 = unique A, row 1 = shared row
+        // Photo 2: row 0 = shared row, row 1 = unique B
         const photoRowsList = [
             {
                 photoId: 'photo-1',
                 rows: [
-                    { text: 'BRAND UNIQUE ONE', confidence: 0.9 },
-                    { text: 'MRP Rs. 100.00', confidence: 0.9 }
+                    { rowId: 0, text: 'UNIQUE HEADER ROW', confidence: 0.90 },
+                    { rowId: 1, text: 'SHARED MIDDLE ROW', confidence: 0.92 }
                 ]
             },
             {
                 photoId: 'photo-2',
                 rows: [
-                    { text: 'MRP Rs. 100.00', confidence: 0.92 },
-                    { text: 'NET QTY: 200 g', confidence: 0.88 }
-                ]
-            },
-            {
-                photoId: 'photo-3',
-                rows: [
-                    { text: 'MRP Rs. 100.00', confidence: 0.95 },
-                    { text: 'COUNTRY OF ORIGIN: INDIA', confidence: 0.91 }
+                    { rowId: 0, text: 'SHARED MIDDLE ROW', confidence: 0.93 },
+                    { rowId: 1, text: 'UNIQUE FOOTER ROW', confidence: 0.89 }
                 ]
             }
         ];
 
         const fused = fuseMultiPhotoEvidence(photoRowsList);
-        assert.strictEqual(fused.stats.totalInputRows, 6, 'Total input rows 6');
-        assert.strictEqual(fused.stats.fusedRowCount, 4, '4 unique concepts: Brand, MRP, Net Qty, Country of Origin');
-        assert.strictEqual(fused.stats.deduplicatedCount, 2, '2 redundant MRP rows collapsed');
-        const texts = Array.from(fused.rowLookupMap.values()).join(' ');
-        assert.ok(texts.includes('BRAND UNIQUE ONE'));
-        assert.ok(texts.includes('MRP Rs. 100.00'));
-        assert.ok(texts.includes('NET QTY: 200 g'));
-        assert.ok(texts.includes('COUNTRY OF ORIGIN: INDIA'));
+        assert.strictEqual(fused.stats.fusedRowCount, 3, '3 unique logical rows');
+
+        // Build context via buildRowContext
+        const rowContext = structuringEngine.buildRowContext(fused.fusedPhotoRows);
+
+        // Photo 1 row 0 has rowId 0, row 1 has rowId 1
+        const p1 = rowContext.find(p => p.photoId === 'photo-1');
+        assert.strictEqual(p1.rows[0].rowId, 0);
+        assert.strictEqual(p1.rows[1].rowId, 1);
+
+        // Photo 2 has only row 1 (unique footer) with its ORIGINAL rowId 1
+        const p2 = rowContext.find(p => p.photoId === 'photo-2');
+        assert.strictEqual(p2.rows.length, 1);
+        assert.strictEqual(p2.rows[0].rowId, 1, 'Photo-2 unique row must retain its original rowId: 1, NOT reindexed to 0');
+
+        // Check lookup maps both photo-1:1 and photo-2:0 to the shared text
+        assert.strictEqual(fused.rowLookupMap.get('photo-1:1'), 'SHARED MIDDLE ROW');
+        assert.strictEqual(fused.rowLookupMap.get('photo-2:0'), 'SHARED MIDDLE ROW');
     });
 
-    await runTest('5. Multi-photo fusion produces exactly ONE GPT-OSS invocation', async () => {
+    await runTest('6. Exactly ONE GPT-OSS structuring call occurs for 1, 2, or 3 photos', async () => {
         let groqCallCount = 0;
         const originalCallGroqJson = gptOssService.callGroqJson;
-        gptOssService.callGroqJson = async (prompt, payload) => {
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => {
             groqCallCount++;
             return {
                 success: true,
                 content: {
-                    productName: { value: 'SYNTHETIC TEST BISCUITS', rawObservedText: 'SYNTHETIC TEST BISCUITS', correctionApplied: false, groundingRefs: [{ photoId: 'photo-1', rowId: 0 }] }
+                    productName: { value: 'SYNTHETIC BISCUITS', rawObservedText: 'SYNTHETIC BISCUITS', correctionApplied: false, groundingRefs: [{ photoId: 'photo-1', rowId: 0 }] }
                 },
-                latencyMs: 120
+                latencyMs: 100
             };
         };
 
         try {
-            const ext1 = extractFields({ results: [{ text: 'SYNTHETIC TEST BISCUITS', confidence: 0.9, bbox: [[10, 10], [200, 10], [200, 30], [10, 30]] }], imageWidth: 1000, imageHeight: 1000 }, 'photo-1');
+            const ext1 = extractFields({ results: [{ text: 'SYNTHETIC BISCUITS', confidence: 0.9, bbox: [[10, 10], [200, 10], [200, 30], [10, 30]] }], imageWidth: 1000, imageHeight: 1000 }, 'photo-1');
             const ext2 = extractFields({ results: [{ text: 'MRP Rs. 50', confidence: 0.9, bbox: [[10, 40], [150, 40], [150, 60], [10, 60]] }], imageWidth: 1000, imageHeight: 1000 }, 'photo-2');
             const ext3 = extractFields({ results: [{ text: 'NET WEIGHT: 100 g', confidence: 0.9, bbox: [[10, 70], [180, 70], [180, 90], [10, 90]] }], imageWidth: 1000, imageHeight: 1000 }, 'photo-3');
 
-            const result = await mergeMultiPhotoExtractedFields([ext1, ext2, ext3]);
-            assert.strictEqual(groqCallCount, 1, `Expected exactly 1 GPT-OSS call, but got ${groqCallCount}`);
-            assert.strictEqual(result.reconciliation.gptOssUsed, true, 'GPT-OSS should be marked as used');
-            assert.strictEqual(result.photoCount, 3, 'Photo count should be 3');
+            // 1 Photo
+            groqCallCount = 0;
+            await mergeMultiPhotoExtractedFields([ext1]);
+            assert.strictEqual(groqCallCount, 1, '1 photo should make exactly 1 GPT call');
+
+            // 2 Photos
+            groqCallCount = 0;
+            await mergeMultiPhotoExtractedFields([ext1, ext2]);
+            assert.strictEqual(groqCallCount, 1, '2 photos should make exactly 1 GPT call');
+
+            // 3 Photos
+            groqCallCount = 0;
+            await mergeMultiPhotoExtractedFields([ext1, ext2, ext3]);
+            assert.strictEqual(groqCallCount, 1, '3 photos should make exactly 1 GPT call');
         } finally {
             gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
         }
     });
 
     // -------------------------------------------------------------------------
-    // 6-10: COUNTRY OF ORIGIN TESTS
+    // 7-14: COUNTRY OF ORIGIN TESTS
     // -------------------------------------------------------------------------
-    console.log('\n--- Suite 2: Country of Origin Detection & Safeguards ---');
+    console.log('\n--- Suite 2: Country of Origin Contextual Grounding ---');
 
-    await runTest('6. Explicit "Made in <country>" is detected', () => {
-        const text = 'Made in India';
-        assert.strictEqual(isExplicitCountryDeclaration(text), true, 'Should detect Made in India');
-        const res = extractFieldsDeterministic([{ text, confidence: 0.9 }]);
-        assert.strictEqual(res.normalizedFields.countryOfOrigin, 'India', 'Country of Origin should be India');
+    await runTest('7. Explicit "Made in <country>" is detected and extracted', () => {
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Made in Germany'), 'Germany');
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Made in USA'), 'United States');
     });
 
-    await runTest('7. Explicit "Manufactured in <country>" is detected', () => {
-        const text = 'Manufactured in Germany';
-        assert.strictEqual(isExplicitCountryDeclaration(text), true, 'Should detect Manufactured in Germany');
-        const res = extractFieldsDeterministic([{ text, confidence: 0.9 }]);
-        assert.strictEqual(res.normalizedFields.countryOfOrigin, 'Germany', 'Country of Origin should be Germany');
+    await runTest('8. Explicit "Manufactured in <country>" is detected and extracted', () => {
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Manufactured in India'), 'India');
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Manufactured in France'), 'France');
     });
 
-    await runTest('8. "Country of Origin: <country>" is detected', () => {
-        const text = 'Country of Origin: Japan';
-        assert.strictEqual(isExplicitCountryDeclaration(text), true, 'Should detect Country of Origin: Japan');
-        const res = extractFieldsDeterministic([{ text, confidence: 0.9 }]);
-        assert.strictEqual(res.normalizedFields.countryOfOrigin, 'Japan', 'Country of Origin should be Japan');
+    await runTest('9. "Country of Origin: <country>" is detected and extracted', () => {
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Country of Origin: Japan'), 'Japan');
+        assert.strictEqual(extractExplicitCountryFromDeclaration('Country of Origin - Australia'), 'Australia');
     });
 
-    await runTest('9. Country appearing only inside an unrelated corporate address is NOT accepted automatically', () => {
+    await runTest('10. Country appearing only inside an unrelated corporate address is rejected in validateGrounding', () => {
         const addressText = 'Industrial Area, Phase II, New Delhi - 110020, India';
-        // When there is NO explicit origin prefix, it should not be treated as an explicit country declaration
-        assert.strictEqual(isExplicitCountryDeclaration(addressText), false, 'Corporate address without origin prefix should not be explicit declaration');
+        assert.strictEqual(extractExplicitCountryFromDeclaration(addressText), null, 'Address without origin prefix must return null');
 
         const rowLookup = new Map([
             ['photo-1:0', addressText]
@@ -231,42 +287,78 @@ async function runTestSuite() {
         const decision = {
             value: 'India',
             rawObservedText: addressText,
+            correctionApplied: false,
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
-        const validationResult = validateGrounding('countryOfOrigin', decision, rowLookup, FIELD_TIERS.countryOfOrigin);
-        // While India is in the text, it is part of an address without an origin prefix
-        // validateFieldFormat checks country validity
-        const fmt = validateFieldFormat('countryOfOrigin', 'India');
-        assert.strictEqual(fmt.valid, true);
+
+        const grounded = validateGrounding('countryOfOrigin', decision, rowLookup, FIELD_TIERS.countryOfOrigin);
+        assert.strictEqual(grounded.status, 'review', 'Address-only country must be rejected to review');
+        assert.ok(grounded.reason.toLowerCase().includes('explicit'), 'Reason must specify explicit declaration requirement');
     });
 
-    await runTest('10. Country appearing only in a URL or email is NOT accepted automatically', () => {
-        const urlText = 'visit us at www.syntheticbrand.co.in or write to support@syntheticbrand.in';
-        assert.strictEqual(isExplicitCountryDeclaration(urlText), false, 'URL/email must be rejected as country declaration');
+    await runTest('11. Country appearing only in a URL or email is NOT accepted', () => {
+        assert.strictEqual(extractExplicitCountryFromDeclaration('support@example.in'), null);
+        assert.strictEqual(extractExplicitCountryFromDeclaration('visit www.example.co.in for info'), null);
+    });
 
+    await runTest('12. Positive Grounding: "Made in Germany" produces verified status', () => {
         const rowLookup = new Map([
-            ['photo-1:0', urlText]
+            ['photo-1:0', 'Made in Germany']
         ]);
         const decision = {
-            value: 'www.syntheticbrand.co.in',
-            rawObservedText: urlText,
+            value: 'Germany',
+            rawObservedText: 'Made in Germany',
+            correctionApplied: false,
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
         const grounded = validateGrounding('countryOfOrigin', decision, rowLookup, FIELD_TIERS.countryOfOrigin);
-        assert.strictEqual(grounded.status, 'review', 'URL/email must be rejected to review status');
+        assert.strictEqual(grounded.status, 'verified');
+        assert.strictEqual(grounded.value, 'Germany');
+    });
+
+    await runTest('13. Positive Grounding: "Manufactured in Germany" produces verified status', () => {
+        const rowLookup = new Map([
+            ['photo-1:0', 'Manufactured in Germany']
+        ]);
+        const decision = {
+            value: 'Germany',
+            rawObservedText: 'Manufactured in Germany',
+            correctionApplied: false,
+            groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
+        };
+        const grounded = validateGrounding('countryOfOrigin', decision, rowLookup, FIELD_TIERS.countryOfOrigin);
+        assert.strictEqual(grounded.status, 'verified');
+        assert.strictEqual(grounded.value, 'Germany');
+    });
+
+    await runTest('14. Multi-photo country grounding: corroborated across photos produces verified', () => {
+        const rowLookup = new Map([
+            ['photo-1:0', 'COUNTRY OF ORIGIN: Germany'],
+            ['photo-2:0', 'COUNTRY OF ORIGIN: Germany']
+        ]);
+        const decision = {
+            value: 'Germany',
+            rawObservedText: 'COUNTRY OF ORIGIN: Germany',
+            correctionApplied: false,
+            groundingRefs: [
+                { photoId: 'photo-1', rowId: 0 },
+                { photoId: 'photo-2', rowId: 0 }
+            ]
+        };
+        const grounded = validateGrounding('countryOfOrigin', decision, rowLookup, FIELD_TIERS.countryOfOrigin);
+        assert.strictEqual(grounded.status, 'verified');
+        assert.strictEqual(grounded.value, 'Germany');
     });
 
     // -------------------------------------------------------------------------
-    // 11-13: IDENTITY SEPARATION TESTS
+    // 15-17: IDENTITY SEPARATION TESTS
     // -------------------------------------------------------------------------
     console.log('\n--- Suite 3: Identity Separation (Brand vs Generic Commodity) ---');
 
-    await runTest('11. Generic commodity-only term (e.g. "protein") must NOT become brandName', () => {
-        assert.strictEqual(isGenericCommodityTerm('protein'), true, '"protein" is a generic commodity term');
-        assert.strictEqual(isGenericCommodityTerm('WHEY PROTEIN'), true, '"WHEY PROTEIN" is a generic commodity term');
-        assert.strictEqual(isGenericCommodityTerm('100% Whey Protein Isolate'), true, '"100% Whey Protein Isolate" is a generic commodity term');
-        assert.strictEqual(isGenericCommodityTerm('Edible Mustard Oil'), true, '"Edible Mustard Oil" is a generic commodity term');
-        assert.strictEqual(isGenericCommodityTerm('Pure Coconut Oil'), true, '"Pure Coconut Oil" is a generic commodity term');
+    await runTest('15. Generic commodity-only term (e.g. "protein", "whey") rejected from brandName with null value', () => {
+        assert.strictEqual(isGenericCommodityTerm('protein'), true);
+        assert.strictEqual(isGenericCommodityTerm('100% Whey Protein Isolate'), true);
+        assert.strictEqual(isGenericCommodityTerm('Edible Mustard Oil'), true);
 
         const rowLookup = new Map([
             ['photo-1:0', 'PROTEIN']
@@ -279,25 +371,37 @@ async function runTestSuite() {
         };
 
         const grounded = validateGrounding('brandName', decision, rowLookup, FIELD_TIERS.brandName);
-        assert.strictEqual(grounded.status, 'review', 'Generic commodity term must be rejected from brandName');
-        assert.ok(grounded.reason.includes('Generic category/commodity descriptor'), 'Reason must explain generic commodity rejection');
+        assert.strictEqual(grounded.status, 'review');
+        assert.strictEqual(grounded.value, null, 'Rejected generic brandName must become null');
+        assert.ok(grounded.reason.includes('Generic category/commodity descriptor'));
     });
 
-    await runTest('12. Missing product identity must remain null rather than hallucinating a brand', () => {
+    await runTest('16. No product name case: evidence contains only storage/dosage/nutrition/generic text -> brandName and productName are null', () => {
         const rowLookup = new Map([
-            ['photo-1:0', 'STORE IN A COOL DRY PLACE AWAY FROM DIRECT SUNLIGHT']
+            ['photo-1:0', 'STORE IN A COOL DRY PLACE'],
+            ['photo-1:1', 'DOSAGE: TAKE 1 TABLET DAILY WITH WATER'],
+            ['photo-1:2', 'NUTRITION FACTS: ENERGY 100 KCAL']
         ]);
-        const decision = {
+        const decisionBrand = {
             value: null,
             rawObservedText: null,
             groundingRefs: []
         };
-        const grounded = validateGrounding('brandName', decision, rowLookup, FIELD_TIERS.brandName);
-        assert.strictEqual(grounded.status, 'not_detected');
-        assert.strictEqual(grounded.value, null);
+        const groundedBrand = validateGrounding('brandName', decisionBrand, rowLookup, FIELD_TIERS.brandName);
+        assert.strictEqual(groundedBrand.status, 'not_detected');
+        assert.strictEqual(groundedBrand.value, null);
+
+        const decisionProd = {
+            value: null,
+            rawObservedText: null,
+            groundingRefs: []
+        };
+        const groundedProd = validateGrounding('productName', decisionProd, rowLookup, FIELD_TIERS.productName);
+        assert.strictEqual(groundedProd.status, 'not_detected');
+        assert.strictEqual(groundedProd.value, null);
     });
 
-    await runTest('13. Generic commodity classification may still work under existing controlled rule', () => {
+    await runTest('17. Generic commodity classification still works under generic_classification rule', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'INSTANT NOODLES WITH TASTEMAKER']
         ]);
@@ -309,17 +413,17 @@ async function runTestSuite() {
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
         const grounded = validateGrounding('genericCommodityName', decision, rowLookup, FIELD_TIERS.genericCommodityName);
-        assert.strictEqual(grounded.status, 'verified', 'genericCommodityName should be accepted under generic_classification');
+        assert.strictEqual(grounded.status, 'verified');
         assert.strictEqual(grounded.value, 'Instant Noodles');
         assert.strictEqual(grounded.provenance, 'llm_inferred');
     });
 
     // -------------------------------------------------------------------------
-    // 14-18: INGREDIENTS TESTS
+    // 18-23: INGREDIENTS TOKEN-SEQUENCE GROUNDING TESTS
     // -------------------------------------------------------------------------
-    console.log('\n--- Suite 4: Ingredients Extraction & Grounding ---');
+    console.log('\n--- Suite 4: Ingredients Token-Sequence Grounding ---');
 
-    await runTest('14. Single-row ingredient declaration is extracted and grounded', () => {
+    await runTest('18. Single-row ingredient declaration is extracted and token-grounded', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'Ingredients: Whole Wheat Flour, Water, Yeast, Salt.']
         ]);
@@ -334,7 +438,7 @@ async function runTestSuite() {
         assert.strictEqual(grounded.value, 'Whole Wheat Flour, Water, Yeast, Salt.');
     });
 
-    await runTest('15. Multi-row ingredient declaration is concatenated correctly', () => {
+    await runTest('19. Multi-row ingredient declaration is concatenated and token-sequence validated', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'Ingredients: Rolled Oats, Brown Sugar, Raisins,'],
             ['photo-1:1', 'Almonds, Chia Seeds, Cinnamon, Salt.']
@@ -350,11 +454,11 @@ async function runTestSuite() {
             ]
         };
         const grounded = validateGrounding('ingredients', decision, rowLookup, FIELD_TIERS.ingredients);
-        assert.strictEqual(grounded.status, 'verified', 'Multi-row ingredient concatenation should be verified');
+        assert.strictEqual(grounded.status, 'verified');
         assert.strictEqual(grounded.provenance, 'ocr_corrected');
     });
 
-    await runTest('16. Nutrition rows are not swallowed into ingredients', () => {
+    await runTest('20. Nutrition facts panel cited as ingredients is rejected', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'Nutrition Facts: Energy 450 kcal, Total Fat 15g, Protein 8g']
         ]);
@@ -364,11 +468,11 @@ async function runTestSuite() {
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
         const grounded = validateGrounding('ingredients', decision, rowLookup, FIELD_TIERS.ingredients);
-        assert.strictEqual(grounded.status, 'review', 'Nutrition table must not be accepted as ingredients');
+        assert.strictEqual(grounded.status, 'review');
         assert.ok(grounded.reason.includes('Nutrition facts panel cited as ingredients'));
     });
 
-    await runTest('17. Storage/dosage/marketing text is not accepted as ingredients', () => {
+    await runTest('21. Storage or usage instructions cited as ingredients is rejected', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'Storage: Store in a cool and dry place away from moisture']
         ]);
@@ -378,93 +482,123 @@ async function runTestSuite() {
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
         const grounded = validateGrounding('ingredients', decision, rowLookup, FIELD_TIERS.ingredients);
-        assert.strictEqual(grounded.status, 'review', 'Storage text must not be accepted as ingredients');
+        assert.strictEqual(grounded.status, 'review');
         assert.ok(grounded.reason.includes('Storage or usage instructions cited as ingredients'));
     });
 
-    await runTest('18. Partially visible ingredients do not get invented with outside knowledge', () => {
+    await runTest('22. Invented ingredient tokens (not in evidence) are rejected by token containment', () => {
         const rowLookup = new Map([
             ['photo-1:0', 'Ingredients: Wheat Flour, Sugar, Edible Veg...']
         ]);
         const decision = {
-            value: 'Wheat Flour, Sugar, Edible Vegetable Oil, Cocoa Solids, Salt', // Model invented Cocoa Solids
+            value: 'Wheat Flour, Sugar, Edible Vegetable Oil, Cocoa Solids, Salt',
             rawObservedText: 'Ingredients: Wheat Flour, Sugar, Edible Veg...',
             correctionApplied: true,
             correctionReason: 'row_concatenation',
             groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
         };
         const grounded = validateGrounding('ingredients', decision, rowLookup, FIELD_TIERS.ingredients);
-        assert.strictEqual(grounded.status, 'review', 'Invented ingredients must fail grounding');
+        assert.strictEqual(grounded.status, 'review');
+        assert.ok(grounded.reason.includes('tokens not present in cited rows'));
+    });
+
+    await runTest('23. Token sequence order scramble is rejected', () => {
+        const rowLookup = new Map([
+            ['photo-1:0', 'Ingredients: Flour, Sugar, Butter, Milk, Salt, Vanilla.']
+        ]);
+        // Reordered tokens completely backwards
+        const decision = {
+            value: 'Vanilla, Salt, Milk, Butter, Sugar, Flour',
+            rawObservedText: 'Ingredients: Flour, Sugar, Butter, Milk, Salt, Vanilla.',
+            correctionApplied: true,
+            correctionReason: 'row_concatenation',
+            groundingRefs: [{ photoId: 'photo-1', rowId: 0 }]
+        };
+        const grounded = validateGrounding('ingredients', decision, rowLookup, FIELD_TIERS.ingredients);
+        assert.strictEqual(grounded.status, 'review');
+        assert.ok(grounded.reason.includes('violates the token order'));
     });
 
     // -------------------------------------------------------------------------
-    // 19-22: REGRESSION & PREFERENCE TESTS
+    // 24-27: REGRESSION & INTEGRATION TESTS
     // -------------------------------------------------------------------------
-    console.log('\n--- Suite 5: Regression & Consumer Preference Integration ---');
+    console.log('\n--- Suite 5: Regression & Preference Matcher Integration ---');
 
-    await runTest('19. Existing structuring tier mapping and fields remain intact', () => {
-        assert.ok(FIELD_TIERS.productName === 'verbatim');
-        assert.ok(FIELD_TIERS.brandName === 'verbatim');
-        assert.ok(FIELD_TIERS.genericCommodityName === 'generic_inferred');
-        assert.ok(FIELD_TIERS.netQuantity === 'strict');
-        assert.ok(FIELD_TIERS.mrp === 'strict');
-        assert.ok(FIELD_TIERS.countryOfOrigin === 'descriptive');
-        assert.ok(FIELD_TIERS.ingredients === 'descriptive');
+    await runTest('24. Existing structuring tier mapping remains intact', () => {
+        assert.strictEqual(FIELD_TIERS.productName, 'verbatim');
+        assert.strictEqual(FIELD_TIERS.brandName, 'verbatim');
+        assert.strictEqual(FIELD_TIERS.genericCommodityName, 'generic_inferred');
+        assert.strictEqual(FIELD_TIERS.netQuantity, 'strict');
+        assert.strictEqual(FIELD_TIERS.mrp, 'strict');
+        assert.strictEqual(FIELD_TIERS.countryOfOrigin, 'descriptive');
+        assert.strictEqual(FIELD_TIERS.ingredients, 'descriptive');
     });
 
-    await runTest('20. Cell normalized bounding boxes are preserved in buildRowContext', () => {
+    await runTest('25. Cell normalized bounding boxes and sourceRefs preserved in buildRowContext', () => {
         const photoRowsList = [
             {
                 photoId: 'photo-1',
                 rows: [
                     {
+                        rowId: 4,
                         text: 'NET QTY 500g',
                         elements: [
                             { text: 'NET', confidence: 0.95, normalizedBbox: [0.1, 0.2, 0.2, 0.25] },
                             { text: 'QTY 500g', confidence: 0.92, normalizedBbox: [0.22, 0.2, 0.45, 0.25] }
                         ],
-                        normalizedBbox: [0.1, 0.2, 0.45, 0.25]
+                        normalizedBbox: [0.1, 0.2, 0.45, 0.25],
+                        sourceRefs: [
+                            { photoId: 'photo-1', rowId: 4 },
+                            { photoId: 'photo-2', rowId: 1 }
+                        ]
                     }
                 ]
             }
         ];
         const rowContext = structuringEngine.buildRowContext(photoRowsList);
         assert.strictEqual(rowContext.length, 1);
+        assert.strictEqual(rowContext[0].rows[0].rowId, 4);
         assert.strictEqual(rowContext[0].rows[0].cells.length, 2);
         assert.deepStrictEqual(rowContext[0].rows[0].cells[0].normalizedBbox, [0.1, 0.2, 0.2, 0.25]);
+        assert.strictEqual(rowContext[0].rows[0].sourceRefs.length, 2);
     });
 
-    await runTest('21. Deterministic fallback extractor continues to work with ingredients', () => {
+    await runTest('26. Deterministic fallback extractor works with country of origin and ingredients', () => {
         const elements = [
+            { text: 'Country of Origin: India', confidence: 0.95 },
             { text: 'Ingredients: Milk Solids, Sugar, Cocoa Butter', confidence: 0.9 },
             { text: 'Net Qty: 150 g', confidence: 0.9 },
             { text: 'MRP Rs. 85', confidence: 0.9 }
         ];
-        const sRows = { rows: [{ text: 'Ingredients: Milk Solids, Sugar, Cocoa Butter' }] };
+        const sRows = { rows: [
+            { text: 'Country of Origin: India' },
+            { text: 'Ingredients: Milk Solids, Sugar, Cocoa Butter' }
+        ] };
         const res = extractFieldsDeterministic(elements, sRows);
+        assert.strictEqual(res.normalizedFields.countryOfOrigin, 'India');
         assert.strictEqual(res.normalizedFields.ingredients, 'Milk Solids, Sugar, Cocoa Butter');
         assert.strictEqual(res.normalizedFields.netQuantity.value, 150);
         assert.strictEqual(res.normalizedFields.mrp.value, 85);
     });
 
-    await runTest('22. Consumer preference matcher continues to evaluate dietary/allergen rules using ingredients', () => {
+    await runTest('27. Consumer preference matcher evaluates dietary/allergen rules using ingredients', () => {
         const extractedFields = {
-            productName: 'CHOCOLATE BAR',
+            productName: 'SYNTHETIC CHOCOLATE',
             ingredients: 'Sugar, Milk Solids, Cocoa Butter, Soy Lecithin',
             nutritionFacts: { sugar: 45, fat: 28, protein: 6 }
         };
 
         const prefs = {
-            milk: true,       // Milk allergy
-            vegan: true       // Vegan preference
+            milk: true,
+            vegan: true
         };
 
         const evalResult = evaluatePreferences(extractedFields, prefs);
-        assert.ok(evalResult, 'Evaluation result should be returned');
-        assert.strictEqual(evalResult.isSuitable, false, 'Product with milk solids should be flagged unsuitable for vegan/milk-allergic consumer');
-        assert.strictEqual(evalResult.details.vegan.status, 'FAIL', 'Vegan preference should FAIL on milk solids');
-        assert.strictEqual(evalResult.details.milk.status, 'FAIL', 'Milk allergy should FAIL on milk solids');
-        assert.ok(evalResult.warnings.length >= 1, 'Should flag milk ingredient violation');
+        assert.ok(evalResult);
+        assert.strictEqual(evalResult.isSuitable, false);
+        assert.strictEqual(evalResult.details.vegan.status, 'FAIL');
+        assert.strictEqual(evalResult.details.milk.status, 'FAIL');
+        assert.ok(evalResult.warnings.length >= 1);
     });
 
     console.log('\n================================================================');

@@ -225,6 +225,11 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
                 fields: {},
                 conflicts: [],
                 gptOssUsed: true,
+                photoCount: singlePhotoExtractions.length,
+                inputRows: fusionResult.stats.totalInputRows,
+                fusedRows: fusionResult.stats.fusedRowCount,
+                deduplicatedRows: fusionResult.stats.deduplicatedCount,
+                preservedUniqueRows: fusionResult.stats.preservedUniqueRows,
                 fusionStats: fusionResult.stats,
                 fusionLatencyMs,
                 diagnostics: structureResult.diagnostics || {}
@@ -252,9 +257,17 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
         // Overlay any explicit non-null values from ext/extNorm (e.g. mock test objects)
         for (const [key, val] of Object.entries(extNorm)) {
             if (val !== null && val !== undefined) {
-                if (typeof val === 'object' && !Array.isArray(val) && val.value !== null && val.value !== undefined) {
+                if (Array.isArray(val) && val.length > 0) {
                     mergedNorm[key] = val;
-                } else if (typeof val !== 'object' && val !== '') {
+                } else if (typeof val === 'object' && val !== null) {
+                    if (val.value !== undefined) {
+                        if (val.value !== null) {
+                            mergedNorm[key] = val;
+                        }
+                    } else if (Object.values(val).some(v => v !== null && v !== undefined && v !== '')) {
+                        mergedNorm[key] = { ...(detNorm[key] || {}), ...val };
+                    }
+                } else if (val !== '') {
                     mergedNorm[key] = val;
                 }
             }
@@ -262,9 +275,17 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
         for (const [key, val] of Object.entries(ext)) {
             if (['structuredRows', '_structuredRowsObj', 'candidateHints', 'rawOcrText', 'imageWidth', 'imageHeight', 'sourceImageId', 'declarations', 'validation', 'normalizedFields'].includes(key)) continue;
             if (val !== null && val !== undefined) {
-                if (typeof val === 'object' && !Array.isArray(val) && val.value !== null && val.value !== undefined) {
+                if (Array.isArray(val) && val.length > 0) {
                     mergedNorm[key] = val;
-                } else if (typeof val !== 'object' && val !== '') {
+                } else if (typeof val === 'object' && val !== null) {
+                    if (val.value !== undefined) {
+                        if (val.value !== null) {
+                            mergedNorm[key] = val;
+                        }
+                    } else if (Object.values(val).some(v => v !== null && v !== undefined && v !== '')) {
+                        mergedNorm[key] = { ...(detNorm[key] || {}), ...val };
+                    }
+                } else if (val !== '') {
                     mergedNorm[key] = val;
                 }
             }

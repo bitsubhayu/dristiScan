@@ -15,7 +15,8 @@ const {
     KNOWN_COUNTRIES,
     sanitizeExtractedText,
     isGenericCommodityTerm,
-    isExplicitCountryDeclaration
+    isExplicitCountryDeclaration,
+    extractExplicitCountryFromDeclaration
 } = require('./textShapeValidators');
 
 const {
@@ -146,37 +147,29 @@ const extractFieldsDeterministic = (rawElements = [], structuredRows = { rows: [
     // 1. Country of Origin
     let countryVal = null;
     let countryElem = null;
-    const cooPrefixRegex = /(?:Country\s*of\s*Origin|Country\s*of\s*Manufacture|Country\s*Manufactured\s*In|Made\s*in|Manufactured\s*in|Product\s*of|Origin)\s*[:.-]?\s*([a-zA-Z\s]{2,30})/i;
-    const cooMatch = fullText.match(cooPrefixRegex);
-    if (cooMatch) {
-        const candidate = cooMatch[1].trim();
-        // Disqualify if candidate or match contains URL, email, or pure address
-        if (!/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(candidate)) {
-            for (const country of KNOWN_COUNTRIES) {
-                if (new RegExp(`\\b${country}\\b`, 'i').test(candidate)) {
-                    if (!/\d|fssai|lic/i.test(candidate)) {
-                        countryVal = country === 'USA' ? 'United States' : country;
-                        countryElem = rawElements.find(r => cooPrefixRegex.test(r.text)) || null;
-                        break;
-                    }
-                }
+
+    for (const el of rawElements) {
+        const country = extractExplicitCountryFromDeclaration(el.text);
+        if (country) {
+            countryVal = country;
+            countryElem = el;
+            break;
+        }
+    }
+    if (!countryVal && structuredRows?.rows) {
+        for (const r of structuredRows.rows) {
+            const country = extractExplicitCountryFromDeclaration(r.text);
+            if (country) {
+                countryVal = country;
+                countryElem = r.elements?.[0] || null;
+                break;
             }
         }
     }
     if (!countryVal) {
-        for (const el of rawElements) {
-            if (/@|www\.|\.(?:com|org|net|in\b|co\.)/i.test(el.text)) continue;
-            if (/\b(?:road|street|nagar|plot|industrial|dist|district|pin\s*code|\b\d{6}\b)\b/i.test(el.text) && !cooPrefixRegex.test(el.text)) continue;
-            if (cooPrefixRegex.test(el.text) || /\b(?:origin|made in|manufactured in|product of)\b/i.test(el.text)) {
-                for (const country of KNOWN_COUNTRIES) {
-                    if (new RegExp(`\\b${country}\\b`, 'i').test(el.text) && !/\d|fssai|lic/i.test(el.text)) {
-                        countryVal = country === 'USA' ? 'United States' : country;
-                        countryElem = el;
-                        break;
-                    }
-                }
-            }
-            if (countryVal) break;
+        const country = extractExplicitCountryFromDeclaration(fullText);
+        if (country) {
+            countryVal = country;
         }
     }
     declarations.countryOfOrigin = createEvidenceRecord(countryVal, countryElem, countryVal ? 'verified' : 'not_detected');
