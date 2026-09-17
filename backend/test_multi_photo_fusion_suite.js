@@ -601,6 +601,38 @@ async function runTestSuite() {
         assert.ok(evalResult.warnings.length >= 1);
     });
 
+    // -------------------------------------------------------------------------
+    // 28-31: SHORT/NON-STATUTORY CONFLICT SAFETY TESTS
+    // -------------------------------------------------------------------------
+    console.log('\n--- Suite 6: Short/Non-Statutory Conflict Safety ---');
+
+    await runTest('28. Short numeric variant labels are NOT merged (Pack of 6 vs Pack of 8)', () => {
+        const { areSafeToMergeRows, normalizeTextForDeduplication } = require('./src/services/multiPhotoEvidenceFusion');
+        const mk = (t) => ({ text: t, normText: normalizeTextForDeduplication(t) });
+        assert.strictEqual(areSafeToMergeRows(mk('Pack of 6'), mk('Pack of 8')), false);
+    });
+
+    await runTest('29. Short letter-variant labels are NOT merged (Type A vs Type B)', () => {
+        const { areSafeToMergeRows, normalizeTextForDeduplication } = require('./src/services/multiPhotoEvidenceFusion');
+        const mk = (t) => ({ text: t, normText: normalizeTextForDeduplication(t) });
+        assert.strictEqual(areSafeToMergeRows(mk('Type A'), mk('Type B')), false);
+    });
+
+    await runTest('30. Legitimate short exact duplicates still merge (regression guard)', () => {
+        const { areSafeToMergeRows, normalizeTextForDeduplication } = require('./src/services/multiPhotoEvidenceFusion');
+        const mk = (t) => ({ text: t, normText: normalizeTextForDeduplication(t) });
+        assert.strictEqual(areSafeToMergeRows(mk('NET WEIGHT: 500 g'), mk('NET WEIGHT: 500 g')), true);
+    });
+
+    await runTest('31. Full fusion: three photos with a Pack-of-6/Pack-of-8 conflict both survive', () => {
+        const { fuseMultiPhotoEvidence } = require('./src/services/multiPhotoEvidenceFusion');
+        const fused = fuseMultiPhotoEvidence([
+            { photoId: 'photo-1', rows: [{ text: 'Pack of 6' }] },
+            { photoId: 'photo-2', rows: [{ text: 'Pack of 8' }] }
+        ]);
+        assert.strictEqual(fused.stats.fusedRowCount, 2, 'Both conflicting pack-count rows must survive as 2 distinct rows');
+    });
+
     console.log('\n================================================================');
     console.log(` RESULTS: ${passedTests} / ${totalTests} tests passed`);
     if (failedTestDetails.length > 0) {

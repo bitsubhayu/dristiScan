@@ -104,6 +104,16 @@ const areSafeToMergeRows = (rowA, rowB) => {
     // 1. If exact normalized text matches: SAFE to merge
     if (normA === normB) return true;
 
+    // 1b. Universal digit-conflict guard — applies to EVERY row pair, not just
+    // rows recognized by STATUTORY_PATTERNS. A lone number difference (a count,
+    // a weight, a code, a variant marker) is always potentially meaningful even
+    // without a recognized label keyword nearby (e.g. "Pack of 6" vs "Pack of 8").
+    const digitsA0 = (textA.match(/\d+(?:\.\d+)?/g) || []).join(' ');
+    const digitsB0 = (textB.match(/\d+(?:\.\d+)?/g) || []).join(' ');
+    if (digitsA0 && digitsB0 && digitsA0 !== digitsB0) {
+        return false;
+    }
+
     const isStatA = isPotentialStatutoryRow(textA);
     const isStatB = isPotentialStatutoryRow(textB);
 
@@ -145,7 +155,17 @@ const areSafeToMergeRows = (rowA, rowB) => {
         return areNearIdentical(normA, normB);
     }
 
-    // For ordinary descriptive prose, retain conservative near-identical logic
+    // 3. Short-string safety guard: below this length, a single-character edit
+    // is disproportionately likely to be a genuinely different short code/label/
+    // variant rather than OCR noise in a longer sentence — require exact match
+    // (already checked above) rather than fuzzy edit-distance-1 tolerance.
+    const SHORT_STRING_EXACT_MATCH_THRESHOLD = 20;
+    const maxLen = Math.max(normA.length, normB.length);
+    if (maxLen < SHORT_STRING_EXACT_MATCH_THRESHOLD) {
+        return false;
+    }
+
+    // For longer ordinary descriptive prose, retain conservative near-identical logic
     return areNearIdentical(normA, normB);
 };
 
