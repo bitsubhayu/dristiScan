@@ -562,7 +562,7 @@ const FIELD_TIERS = {
  * 3d. The main export function.
  * Orchestrates LLM structuring and deterministic grounding validation.
  */
-const structureFields = async (photoRowsList = [], deterministicHints = []) => {
+const structureFields = async (photoRowsList = [], deterministicHints = [], precomputedRowLookup = null) => {
     if (!gptOssService.isAvailable()) {
         return { success: false, skipped: true, reason: 'GROQ_API_KEY is not configured' };
     }
@@ -577,27 +577,30 @@ const structureFields = async (photoRowsList = [], deterministicHints = []) => {
     const result = await gptOssService.callGroqJson(STRUCTURING_SYSTEM_PROMPT, userPayload);
     if (!result.success) return result;
 
-    const rowLookup = new Map();
-    photoRowsList.forEach(({ photoId, rows }) => {
-        (rows || []).forEach((row, rowIndex) => {
-            const stableRowId = row.rowId !== undefined ? row.rowId : rowIndex;
-            const text = (row.elements && row.elements.length > 0)
-                ? row.elements.map(e => e.text).join(' ')
-                : (row.text || '');
+    let rowLookup;
+    if (precomputedRowLookup instanceof Map) {
+        rowLookup = precomputedRowLookup;
+    } else {
+        rowLookup = new Map();
+        photoRowsList.forEach(({ photoId, rows }) => {
+            (rows || []).forEach((row, rowIndex) => {
+                const stableRowId = row.rowId !== undefined ? row.rowId : rowIndex;
+                const text = row.text || (row.elements && row.elements.length > 0
+                    ? row.elements.map(e => e.text).join(' ')
+                    : '');
 
-            // Map canonical row ID
-            rowLookup.set(`${photoId}:${stableRowId}`, text);
+                rowLookup.set(`${photoId}:${stableRowId}`, text);
 
-            // Map all supporting source refs
-            const refs = Array.isArray(row.sourceRefs) && row.sourceRefs.length > 0
-                ? row.sourceRefs
-                : [{ photoId, rowId: stableRowId }];
+                const refs = Array.isArray(row.sourceRefs) && row.sourceRefs.length > 0
+                    ? row.sourceRefs
+                    : [{ photoId, rowId: stableRowId }];
 
-            refs.forEach(ref => {
-                rowLookup.set(`${ref.photoId}:${ref.rowId}`, text);
+                refs.forEach(ref => {
+                    rowLookup.set(`${ref.photoId}:${ref.rowId}`, text);
+                });
             });
         });
-    });
+    }
 
     const parsedContent = result.content || {};
 

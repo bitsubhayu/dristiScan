@@ -207,7 +207,11 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
     const fusionLatencyMs = Date.now() - fusionStart;
 
     // Attempt unified structuring via structuringEngine (GPT-OSS) exactly ONCE
-    const structureResult = await structuringEngine.structureFields(fusionResult.fusedPhotoRows, deterministicHints);
+    const structureResult = await structuringEngine.structureFields(
+        fusionResult.fusedPhotoRows,
+        deterministicHints,
+        fusionResult.rowLookupMap
+    );
 
     if (structureResult.success) {
         const normalizedFields = {
@@ -220,10 +224,10 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
             declarations: structureResult.declarations,
             validation: structureResult.validation,
             photoCount: singlePhotoExtractions.length,
-            conflicts: [],
+            conflicts: fusionResult.conflicts || [],
             reconciliation: {
                 fields: {},
-                conflicts: [],
+                conflicts: fusionResult.conflicts || [],
                 gptOssUsed: true,
                 photoCount: singlePhotoExtractions.length,
                 inputRows: fusionResult.stats.totalInputRows,
@@ -394,10 +398,10 @@ const mergeMultiPhotoExtractedFields = async (singlePhotoExtractions = [], image
         declarations: mergedDeclarations,
         validation: mergedValidation,
         photoCount: singlePhotoExtractions.length,
-        conflicts: [],
+        conflicts: fusionResult.conflicts || [],
         reconciliation: {
             fields: {},
-            conflicts: [],
+            conflicts: fusionResult.conflicts || [],
             gptOssUsed: false,
             structuringMode: 'deterministic_fallback'
         },

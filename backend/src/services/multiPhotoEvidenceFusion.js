@@ -74,21 +74,70 @@ const areNearIdentical = (normA, normB) => {
 /**
  * Identifies whether a text line contains statutory / regulatory declaration concepts.
  */
-const STATUTORY_PATTERNS = [
-    /\b(?:mrp|m\.?\s*r\.?\s*p|max(?:imum)?\s*retail\s*price)\b/i,
-    /\b(?:usp|unit\s*sale\s*price)\b/i,
-    /\b(?:net\s*(?:qty|quantity|weight|wt|vol|volume|contents))\b/i,
-    /\b(?:exp|expiry|use\s*by|best\s*before)\b/i,
-    /\b(?:mfg|mfd|packed|pkd|manufactured|date\s*of\s*(?:mfg|pkd|packaging))\b/i,
-    /\b(?:batch|lot|b\.?\s*no)\b/i,
-    /\b(?:fssai|lic(?:ense)?\s*no)\b/i,
-    /\b(?:country\s*of\s*origin|country\s*of\s*manufacture|made\s*in|manufactured\s*in|product\s*of|origin)\b/i,
-    /\b(?:ingredients?|ingredents?)\b/i
-];
+const STATUTORY_CATEGORIES = {
+    mrp: /\b(?:mrp|m\.?\s*r\.?\s*p|max(?:imum)?\s*retail\s*price)\b/i,
+    unitSalePrice: /\b(?:usp|unit\s*sale\s*price)\b/i,
+    netQuantity: /\b(?:net\s*(?:qty|quantity|weight|wt|vol|volume|contents))\b/i,
+    dateOfExpiry: /\b(?:exp|expiry|use\s*by|best\s*before)\b/i,
+    dateOfManufacture: /\b(?:mfg|mfd|packed|pkd|manufactured|date\s*of\s*(?:mfg|pkd|packaging))\b/i,
+    batchNumber: /\b(?:batch|lot|b\.?\s*no)\b/i,
+    fssaiLicenseNumber: /\b(?:fssai|lic(?:ense)?\s*no)\b/i,
+    countryOfOrigin: /\b(?:country\s*of\s*origin|country\s*of\s*manufacture|made\s*in|manufactured\s*in|product\s*of|origin)\b/i,
+    ingredients: /\b(?:ingredients?|ingredents?)\b/i
+};
+
+// Backward compatibility: existing callers must continue to receive an array.
+const STATUTORY_PATTERNS = Object.values(STATUTORY_CATEGORIES);
 
 const isPotentialStatutoryRow = (text) => {
     if (!text || typeof text !== 'string') return false;
     return STATUTORY_PATTERNS.some(pat => pat.test(text));
+};
+
+const getStatutoryCategory = (text) => {
+    if (!text || typeof text !== 'string') return null;
+    for (const [category, pattern] of Object.entries(STATUTORY_CATEGORIES)) {
+        if (pattern.test(text)) {
+            return category;
+        }
+    }
+    return null;
+};
+
+const extractDigitTokens = (text) =>
+    (String(text || '').match(/\d+(?:\.\d+)?/g) || []).join(' ');
+
+const stripDigitsForStatutoryComparison = (text) =>
+    normalizeTextForDeduplication(text)
+        .replace(/\d+(?:\.\d+)?/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+const detectStatutoryValueConflict = (rowA, rowB) => {
+    const textA = rowA?.text || '';
+    const textB = rowB?.text || '';
+    const categoryA = getStatutoryCategory(textA);
+    const categoryB = getStatutoryCategory(textB);
+
+    // Both rows must belong to the same statutory category.
+    if (!categoryA || categoryA !== categoryB) {
+        return false;
+    }
+
+    const digitsA = extractDigitTokens(textA);
+    const digitsB = extractDigitTokens(textB);
+
+    // No numeric disagreement => no conflict.
+    if (!digitsA || !digitsB || digitsA === digitsB) {
+        return false;
+    }
+
+    // The non-numeric declaration text must be very close.
+    // This prevents unrelated rows in the same broad category from
+    // being incorrectly reported as conflicts.
+    const labelA = stripDigitsForStatutoryComparison(textA);
+    const labelB = stripDigitsForStatutoryComparison(textB);
+    return areNearIdentical(labelA, labelB);
 };
 
 /**
@@ -254,7 +303,46 @@ const fuseMultiPhotoEvidence = (photoRowsList = []) => {
     // Multi-photo fusion: cluster repeated rows across photos with conflict safety
     const clusters = [];
 
+    const statutoryObservations = new Map();
+    const conflictRecordsByField = new Map();
+
     for (const item of flatRows) {
+        // Lightweight statutory conflict tracking (deterministic, no LLM)
+        const statutoryField = getStatutoryCategory(item.text);
+        if (statutoryField) {
+            const previousObservations = statutoryObservations.get(statutoryField) || [];
+            for (const previous of previousObservations) {
+                if (!detectStatutoryValueConflict(previous, item)) {
+                    continue;
+                }
+                let conflictRecord = conflictRecordsByField.get(statutoryField);
+                if (!conflictRecord) {
+                    conflictRecord = {
+                        field: statutoryField,
+                        message: `Different ${statutoryField} values detected across photos`,
+                        detectedValues: []
+                    };
+                    conflictRecordsByField.set(statutoryField, conflictRecord);
+                }
+                const previousValue = { photo: previous.photoId, value: previous.text };
+                const currentValue = { photo: item.photoId, value: item.text };
+                const alreadyHasPrevious = conflictRecord.detectedValues.some(
+                    v => v.photo === previousValue.photo && v.value === previousValue.value
+                );
+                if (!alreadyHasPrevious) {
+                    conflictRecord.detectedValues.push(previousValue);
+                }
+                const alreadyHasCurrent = conflictRecord.detectedValues.some(
+                    v => v.photo === currentValue.photo && v.value === currentValue.value
+                );
+                if (!alreadyHasCurrent) {
+                    conflictRecord.detectedValues.push(currentValue);
+                }
+            }
+            previousObservations.push(item);
+            statutoryObservations.set(statutoryField, previousObservations);
+        }
+
         if (!item.normText || item.normText.length < 2) {
             // Keep very short or empty rows as standalone unique clusters
             clusters.push({
@@ -298,6 +386,10 @@ const fuseMultiPhotoEvidence = (photoRowsList = []) => {
                 if (item.normalizedBbox && item.normalizedBbox.length > 0) {
                     matchedCluster.bestBbox = item.normalizedBbox;
                 }
+                // Keep originalRow in sync with whichever observation actually won —
+                // this is what previously let a losing photo's stale .elements array
+                // keep riding along on the consolidated row after a clearer photo won.
+                matchedCluster.originalRow = item.rowRef;
             } else {
                 matchedCluster.bestConfidence = Math.max(matchedCluster.bestConfidence, item.confidence);
             }
@@ -365,11 +457,13 @@ const fuseMultiPhotoEvidence = (photoRowsList = []) => {
     const fusedRowCount = clusters.length;
     const deduplicatedCount = totalInputRows - fusedRowCount;
     const preservedUniqueRows = clusters.filter(c => c.refs.length === 1).length;
+    const conflicts = Array.from(conflictRecordsByField.values());
 
     return {
         fusedPhotoRows,
         rowLookupMap,
         allGroundingRefs,
+        conflicts,
         stats: {
             totalInputRows,
             fusedRowCount,
@@ -385,5 +479,7 @@ module.exports = {
     areNearIdentical,
     isPotentialStatutoryRow,
     areSafeToMergeRows,
-    fuseMultiPhotoEvidence
+    fuseMultiPhotoEvidence,
+    getStatutoryCategory,
+    detectStatutoryValueConflict
 };
