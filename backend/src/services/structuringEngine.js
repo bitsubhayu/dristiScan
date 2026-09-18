@@ -618,7 +618,7 @@ const structureFields = async (photoRowsList = [], deterministicHints = [], prec
         netQuantity: { value: null, unit: null },
         servingsPerContainer: null,
         servingSize: null,
-        mrp: { value: null, currency: 'INR', inclusiveOfTaxes: true },
+        mrp: { value: null, currency: 'INR', inclusiveOfTaxes: null },
         dates: { manufacture: null, expiry: null, bestBefore: null },
         consumerCare: { name: null, address: null, phone: null, email: null },
         countryOfOrigin: null,
@@ -669,26 +669,72 @@ const structureFields = async (photoRowsList = [], deterministicHints = [], prec
         const tier = FIELD_TIERS[fieldKey];
         const decision = parsedContent[fieldKey] || { value: null };
 
-        // Handle nested nutritionFacts sub-values or flat object
+        // Handle nested nutritionFacts sub-values with evidence grounding
         if (fieldKey === 'nutritionFacts' && decision.value && typeof decision.value === 'object') {
             const subFacts = decision.value;
             const validNutrition = {};
+            const rejectedNutrition = {};
+
+            // Collect evidence texts from nutrition grounding refs
+            const nutritionRefs = Array.isArray(decision.groundingRefs) ? decision.groundingRefs : [];
+            const nutritionEvidenceTexts = nutritionRefs
+                .map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '')
+                .filter(Boolean);
+            // Also check all row evidence for nutrition-related content
+            const allNutritionEvidence = Array.from(rowLookup.values())
+                .filter(t => /(?:nutrition|energy|protein|fat|carbohydrate|sugar|sodium|fiber|fibre|calori)/i.test(t));
+            const combinedNutritionEvidence = [...nutritionEvidenceTexts, ...allNutritionEvidence]
+                .join(' ').toLowerCase();
+
             for (const [nutrKey, nutrVal] of Object.entries(subFacts)) {
-                if (nutrVal !== null && nutrVal !== undefined) {
-                    validNutrition[nutrKey] = typeof nutrVal === 'object' ? nutrVal.value : nutrVal;
+                if (nutrVal === null || nutrVal === undefined) continue;
+
+                const rawValue = typeof nutrVal === 'object' ? nutrVal.value : nutrVal;
+                if (rawValue === null || rawValue === undefined) continue;
+
+                // Ground each nutrition sub-value against OCR evidence
+                const valStr = String(rawValue).toLowerCase().replace(/[^a-z0-9.%]/g, '');
+                const keyStr = nutrKey.toLowerCase();
+
+                // Accept if: (a) the nutrient key appears in evidence, AND
+                //             (b) the numeric portion of the value appears near it
+                const keyPresent = combinedNutritionEvidence.includes(keyStr) ||
+                    (keyStr === 'calories' && /(?:calori|energy|kcal)/i.test(combinedNutritionEvidence)) ||
+                    (keyStr === 'fiber' && /(?:fib[re]|fibre)/i.test(combinedNutritionEvidence)) ||
+                    (keyStr === 'fat' && /\bfat\b/i.test(combinedNutritionEvidence)) ||
+                    (keyStr === 'sodium' && /sodium/i.test(combinedNutritionEvidence));
+
+                const numericPart = String(rawValue).match(/[\d]+(?:\.[\d]+)?/);
+                const numericPresent = numericPart
+                    ? combinedNutritionEvidence.includes(numericPart[0])
+                    : false;
+
+                if (keyPresent && (numericPresent || !numericPart)) {
+                    validNutrition[nutrKey] = rawValue;
+                } else if (combinedNutritionEvidence.length === 0) {
+                    // No nutrition evidence at all — reject everything
+                    rejectedNutrition[nutrKey] = { value: rawValue, reason: 'No nutrition evidence in OCR rows' };
+                } else {
+                    rejectedNutrition[nutrKey] = { value: rawValue, reason: `Nutrient "${nutrKey}" value "${rawValue}" not grounded in OCR evidence` };
                 }
             }
+
             normalizedFields.nutritionFacts = validNutrition;
+            const hasAccepted = Object.keys(validNutrition).length > 0;
+            const hasRejected = Object.keys(rejectedNutrition).length > 0;
             declarations.nutritionFacts = {
                 value: validNutrition,
                 rawText: decision.rawObservedText || null,
                 confidence: typeof decision.confidence === 'number' ? decision.confidence : 0.85,
-                status: Object.keys(validNutrition).length > 0 ? 'verified' : 'not_detected',
+                status: hasAccepted ? 'verified' : 'not_detected',
                 provenance: 'gpt_oss',
                 source: 'gpt_oss_structuring',
                 diagnostics: {
-                    stage: Object.keys(validNutrition).length > 0 ? 'value_accepted' : 'ocr_evidence_absent',
-                    detail: Object.keys(validNutrition).length > 0 ? 'Verified nutrition facts' : 'No nutrition facts detected'
+                    stage: hasAccepted ? 'value_accepted' : 'ocr_evidence_absent',
+                    detail: hasAccepted
+                        ? (hasRejected ? `Partially grounded: accepted ${Object.keys(validNutrition).join(', ')}; rejected ${Object.keys(rejectedNutrition).join(', ')}` : 'All nutrition values grounded against OCR evidence')
+                        : 'No nutrition values could be grounded against OCR evidence',
+                    rejectedValues: hasRejected ? rejectedNutrition : undefined
                 }
             };
             diagnostics.nutritionFacts = declarations.nutritionFacts.diagnostics;
@@ -809,19 +855,43 @@ const structureFields = async (photoRowsList = [], deterministicHints = [], prec
             case 'mrp':
                 if (acceptedVal && typeof acceptedVal === 'object') {
                     const num = parseFloat(acceptedVal.amount || acceptedVal.value);
+                    // Determine tax inclusion from OCR evidence, not assumption
+                    const mrpRefs = Array.isArray(decision.groundingRefs) ? decision.groundingRefs : [];
+                    const mrpEvidenceText = mrpRefs
+                        .map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '')
+                        .join(' ').toLowerCase();
+                    let taxInclusion = null;
+                    if (/\b(?:inclusive|incl\.?)\s*(?:of\s*)?(?:all\s*)?tax/i.test(mrpEvidenceText)) {
+                        taxInclusion = true;
+                    } else if (/\b(?:exclusive|excl\.?)\s*(?:of\s*)?(?:all\s*)?tax/i.test(mrpEvidenceText) ||
+                               /\bexcluding\s*tax/i.test(mrpEvidenceText)) {
+                        taxInclusion = false;
+                    }
                     normalizedFields.mrp = {
                         value: !isNaN(num) ? num : null,
                         currency: acceptedVal.currency || 'INR',
-                        inclusiveOfTaxes: true
+                        inclusiveOfTaxes: taxInclusion
                     };
                 } else if (acceptedVal) {
                     const m = String(acceptedVal).match(/\d+(?:\.\d+)?/);
                     const num = m ? parseFloat(m[0]) : NaN;
                     if (!isNaN(num)) {
+                        // Check row evidence for tax inclusion/exclusion language
+                        const mrpRefsFlat = Array.isArray(decision.groundingRefs) ? decision.groundingRefs : [];
+                        const mrpEvText = mrpRefsFlat
+                            .map(r => rowLookup.get(`${r.photoId}:${r.rowId}`) || '')
+                            .join(' ').toLowerCase();
+                        let taxIncl = null;
+                        if (/\b(?:inclusive|incl\.?)\s*(?:of\s*)?(?:all\s*)?tax/i.test(mrpEvText)) {
+                            taxIncl = true;
+                        } else if (/\b(?:exclusive|excl\.?)\s*(?:of\s*)?(?:all\s*)?tax/i.test(mrpEvText) ||
+                                   /\bexcluding\s*tax/i.test(mrpEvText)) {
+                            taxIncl = false;
+                        }
                         normalizedFields.mrp = {
                             value: num,
                             currency: 'INR',
-                            inclusiveOfTaxes: true
+                            inclusiveOfTaxes: taxIncl
                         };
                     }
                 }

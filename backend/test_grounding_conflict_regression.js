@@ -447,6 +447,250 @@ async function runRegressionSuite() {
         }
     });
 
+    // -------------------------------------------------------------------------
+    // NUTRITION GROUNDING (Part 4A proof)
+    // -------------------------------------------------------------------------
+    console.log('\n--- Suite G: Nutrition Grounding ---');
+
+    await runTest('G1. Nutrition value NOT in OCR evidence is rejected', async () => {
+        const originalCallGroqJson = gptOssService.callGroqJson;
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => ({
+            success: true,
+            content: {
+                nutritionFacts: {
+                    value: {
+                        calories: '250 kcal',
+                        protein: '10 g',
+                        fat: '5 g'
+                    },
+                    rawObservedText: 'Nutrition Information',
+                    correctionApplied: false,
+                    groundingRefs: [{ photoId: 'photo-1', rowId: 0 }],
+                    confidence: 0.90
+                }
+            },
+            latencyMs: 50
+        });
+
+        try {
+            // OCR evidence has NO nutrition content at all
+            const photoRowsList = [{
+                photoId: 'photo-1',
+                rows: [{
+                    rowId: 0,
+                    text: 'PREMIUM QUALITY PRODUCT',
+                    confidence: 0.95,
+                    cells: [{ text: 'PREMIUM QUALITY PRODUCT', confidence: 0.95 }]
+                }]
+            }];
+
+            const precomputedMap = new Map();
+            precomputedMap.set('photo-1:0', 'PREMIUM QUALITY PRODUCT');
+
+            const result = await structuringEngine.structureFields(photoRowsList, [], precomputedMap);
+            assert.strictEqual(result.success, true);
+
+            // All nutrition values should be rejected — no nutrition evidence in OCR
+            const nutFacts = result.normalizedFields.nutritionFacts;
+            assert.strictEqual(Object.keys(nutFacts).length, 0,
+                'No nutrition values should be accepted when OCR has no nutrition evidence');
+
+            const nutDecl = result.declarations.nutritionFacts;
+            assert.ok(nutDecl, 'Nutrition declaration should exist');
+            assert.strictEqual(nutDecl.status, 'not_detected',
+                'Nutrition status should be not_detected when no evidence');
+        } finally {
+            gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
+        }
+    });
+
+    await runTest('G2. Nutrition value WITH matching OCR evidence is accepted', async () => {
+        const originalCallGroqJson = gptOssService.callGroqJson;
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => ({
+            success: true,
+            content: {
+                nutritionFacts: {
+                    value: {
+                        calories: '250 kcal',
+                        protein: '10 g'
+                    },
+                    rawObservedText: 'Energy 250 kcal Protein 10 g',
+                    correctionApplied: false,
+                    groundingRefs: [{ photoId: 'photo-1', rowId: 0 }, { photoId: 'photo-1', rowId: 1 }],
+                    confidence: 0.92
+                }
+            },
+            latencyMs: 50
+        });
+
+        try {
+            const photoRowsList = [{
+                photoId: 'photo-1',
+                rows: [
+                    {
+                        rowId: 0,
+                        text: 'Nutrition Information Energy 250 kcal',
+                        confidence: 0.95,
+                        cells: [{ text: 'Nutrition Information Energy 250 kcal', confidence: 0.95 }]
+                    },
+                    {
+                        rowId: 1,
+                        text: 'Protein 10 g Fat 5 g',
+                        confidence: 0.93,
+                        cells: [{ text: 'Protein 10 g Fat 5 g', confidence: 0.93 }]
+                    }
+                ]
+            }];
+
+            const precomputedMap = new Map();
+            precomputedMap.set('photo-1:0', 'Nutrition Information Energy 250 kcal');
+            precomputedMap.set('photo-1:1', 'Protein 10 g Fat 5 g');
+
+            const result = await structuringEngine.structureFields(photoRowsList, [], precomputedMap);
+            assert.strictEqual(result.success, true);
+
+            const nutFacts = result.normalizedFields.nutritionFacts;
+            assert.ok(nutFacts.calories, 'Calories should be accepted — evidence present');
+            assert.ok(nutFacts.protein, 'Protein should be accepted — evidence present');
+        } finally {
+            gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // MRP TAX INCLUSION (Part 4B proof)
+    // -------------------------------------------------------------------------
+    console.log('\n--- Suite H: MRP Tax Inclusion ---');
+
+    await runTest('H1. Explicit "Inclusive of all taxes" → inclusiveOfTaxes === true', async () => {
+        const originalCallGroqJson = gptOssService.callGroqJson;
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => ({
+            success: true,
+            content: {
+                mrp: {
+                    value: { amount: 99, currency: 'INR' },
+                    rawObservedText: 'MRP ₹99 Inclusive of all taxes',
+                    correctionApplied: false,
+                    groundingRefs: [{ photoId: 'photo-1', rowId: 0 }],
+                    confidence: 0.95
+                }
+            },
+            latencyMs: 50
+        });
+
+        try {
+            const photoRowsList = [{
+                photoId: 'photo-1',
+                rows: [{
+                    rowId: 0,
+                    text: 'MRP ₹99 Inclusive of all taxes',
+                    confidence: 0.95,
+                    cells: [{ text: 'MRP ₹99 Inclusive of all taxes', confidence: 0.95 }]
+                }]
+            }];
+            const precomputedMap = new Map();
+            precomputedMap.set('photo-1:0', 'MRP ₹99 Inclusive of all taxes');
+
+            const result = await structuringEngine.structureFields(photoRowsList, [], precomputedMap);
+            assert.strictEqual(result.success, true);
+            assert.strictEqual(result.normalizedFields.mrp.inclusiveOfTaxes, true,
+                'Should be true when evidence says "Inclusive of all taxes"');
+        } finally {
+            gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
+        }
+    });
+
+    await runTest('H2. Explicit "excluding taxes" → inclusiveOfTaxes === false', async () => {
+        const originalCallGroqJson = gptOssService.callGroqJson;
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => ({
+            success: true,
+            content: {
+                mrp: {
+                    value: { amount: 99, currency: 'INR' },
+                    rawObservedText: 'MRP ₹99 excluding taxes',
+                    correctionApplied: false,
+                    groundingRefs: [{ photoId: 'photo-1', rowId: 0 }],
+                    confidence: 0.95
+                }
+            },
+            latencyMs: 50
+        });
+
+        try {
+            const photoRowsList = [{
+                photoId: 'photo-1',
+                rows: [{
+                    rowId: 0,
+                    text: 'MRP ₹99 excluding taxes',
+                    confidence: 0.95,
+                    cells: [{ text: 'MRP ₹99 excluding taxes', confidence: 0.95 }]
+                }]
+            }];
+            const precomputedMap = new Map();
+            precomputedMap.set('photo-1:0', 'MRP ₹99 excluding taxes');
+
+            const result = await structuringEngine.structureFields(photoRowsList, [], precomputedMap);
+            assert.strictEqual(result.success, true);
+            assert.strictEqual(result.normalizedFields.mrp.inclusiveOfTaxes, false,
+                'Should be false when evidence says "excluding taxes"');
+        } finally {
+            gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
+        }
+    });
+
+    await runTest('H3. No tax statement → inclusiveOfTaxes === null', async () => {
+        const originalCallGroqJson = gptOssService.callGroqJson;
+        const originalIsAvailable = gptOssService.isAvailable;
+        gptOssService.isAvailable = () => true;
+        gptOssService.callGroqJson = async () => ({
+            success: true,
+            content: {
+                mrp: {
+                    value: { amount: 99, currency: 'INR' },
+                    rawObservedText: 'MRP ₹99',
+                    correctionApplied: false,
+                    groundingRefs: [{ photoId: 'photo-1', rowId: 0 }],
+                    confidence: 0.95
+                }
+            },
+            latencyMs: 50
+        });
+
+        try {
+            const photoRowsList = [{
+                photoId: 'photo-1',
+                rows: [{
+                    rowId: 0,
+                    text: 'MRP ₹99',
+                    confidence: 0.95,
+                    cells: [{ text: 'MRP ₹99', confidence: 0.95 }]
+                }]
+            }];
+            const precomputedMap = new Map();
+            precomputedMap.set('photo-1:0', 'MRP ₹99');
+
+            const result = await structuringEngine.structureFields(photoRowsList, [], precomputedMap);
+            assert.strictEqual(result.success, true);
+            assert.strictEqual(result.normalizedFields.mrp.inclusiveOfTaxes, null,
+                'Should be null when no tax statement in evidence');
+        } finally {
+            gptOssService.callGroqJson = originalCallGroqJson;
+            gptOssService.isAvailable = originalIsAvailable;
+        }
+    });
+
     console.log('\n================================================================');
     console.log(` RESULTS: ${passedTests} / ${totalTests} tests passed`);
     if (failedTestDetails.length > 0) {
