@@ -133,7 +133,7 @@ async function runTestSuite() {
     
     recordTest('TEST_3', 'Unit Sale Price (13.99) extraction via spatial pairing or fallback', uspExtracted, {
         unitSalePrice: uspValue,
-        source: merged.declarations?.unitSalePrice?.source || 'paddleocr_primary',
+        source: merged.declarations?.unitSalePrice?.source || 'google_vision_primary',
         aiAssisted: Boolean(merged.declarations?.unitSalePrice?.aiAssisted)
     });
 

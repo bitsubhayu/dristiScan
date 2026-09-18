@@ -131,6 +131,8 @@ const MARKETING_BADGE_PATTERNS = [
     /\b(?:money\s*back|satisfaction)\s*(?:guarantee)?\b/i,
     /\b(?:new|improved|advanced|ultra|super|mega|pro|max)\b/i,
     /^\s*(?:made\s*in|product\s*of|manufactured|marketed|packed|imported)\b/i,
+    /\b(?:not\s*for\s*medicinal\s*use|for\s*therapeutic\s*use|health\s*supplement|dietary\s*supplement)\b/i,
+    /\b(?:keep\s*out\s*of\s*reach|store\s*in\s*a\s*cool|recommended\s*usage|appropriate\s*overages)\b/i,
 ];
 
 /**
@@ -331,10 +333,10 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
 
     /**
      * Phase 5: Enhanced evidence record with provenance tracking
-     * @param {string} source - 'paddleocr_primary', 'spatial_pairing', 'gemini_reconciliation', or 'gemini_fallback'
+     * @param {string} source - 'google_vision_primary', 'spatial_pairing', 'gemini_reconciliation', or 'gemini_fallback'
      * @param {boolean} aiAssisted - true only for gemini_fallback (requires visible UI label)
      */
-    const createEvidenceRecord = (value, rawElem, status = 'verified', evidenceList = [], source = 'paddleocr_primary', aiAssisted = false) => {
+    const createEvidenceRecord = (value, rawElem, status = 'verified', evidenceList = [], source = 'google_vision_primary', aiAssisted = false) => {
         const cleanVal = sanitizeExtractedText(value);
         return {
             value: cleanVal,
@@ -558,7 +560,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (/^(?:Batch|Lot|B\.?\s*No\.?|Batch\s*No\.?)$/i.test(el.text.trim())) {
             for (let j = 1; j <= 5 && i + j < rawElements.length; j++) {
                 const cand = rawElements[i + j].text.trim();
-                if (/^[A-Za-z0-9]{4,15}$/.test(cand) && !/^(?:MRP|USP|RS|ALL|TAX|DATE|NOV|MAY|EXP|MFG)$/i.test(cand) && !/^\d+$/.test(cand)) {
+                if (/^[A-Za-z0-9/-]{3,20}$/.test(cand) && !/^(?:MRP|USP|RS|ALL|TAX|DATE|NOV|MAY|EXP|MFG)$/i.test(cand) && !/^\d+$/.test(cand)) {
                     batchVal = cand;
                     batchElem = rawElements[i + j];
                     break;
@@ -712,7 +714,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // -------------------------------------------------------------
     let uspVal = null;
     let uspElem = null;
-    let uspSource = 'paddleocr_primary';
+    let uspSource = 'google_vision_primary';
     const uspRegex = /(?:USP|Unit\s*Sale\s*Price|Rs\.?\s*per)\s*[:.-]?\s*(?:Rs\.?|₹)?\s*(\d+(?:\.\d+)?)\s*(?:\/|\s*per\s*)?([a-zA-Z.]+)?/i;
     for (const el of rawElements) {
         const um = el.text.match(uspRegex);
@@ -760,7 +762,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     // -------------------------------------------------------------
     let mrpVal = null;
     let mrpElem = null;
-    let mrpSource = 'paddleocr_primary';
+    let mrpSource = 'google_vision_primary';
     let inclTaxes = null;
 
     // Bug 6 fix: Broader MRP regex to handle M.R.P., M R P, MRP. etc
@@ -838,7 +840,9 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         sourceImageId,
         sourceRegion: { bbox: mrpElem ? mrpElem.bbox : [] },
         status: mrpVal ? 'verified' : 'not_detected',
-        evidence: mrpElem ? [mrpElem.text] : []
+        evidence: mrpElem ? [mrpElem.text] : [],
+        source: mrpSource,
+        aiAssisted: false
     };
     validation.mrp = {
         status: mrpVal ? 'verified' : 'not_detected',
@@ -1120,12 +1124,12 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         status: mfrName ? 'verified' : 'not_detected',
         rawText: mfrElem ? mfrElem.text : null,
         confidence: mfrElem ? mfrElem.confidence : 0,
-        source: spatialPairs['manufacturer.name'] && mfrName === spatialPairs['manufacturer.name'].value ? 'spatial_pairing' : 'paddleocr_primary',
+        source: spatialPairs['manufacturer.name'] && mfrName === spatialPairs['manufacturer.name'].value ? 'spatial_pairing' : 'google_vision_primary',
         aiAssisted: false
     };
-    declarations.packer = { name: pkrName, address: null, status: pkrName ? 'verified' : 'not_detected', source: 'paddleocr_primary', aiAssisted: false };
-    declarations.importer = { name: impName, address: null, status: impName ? 'verified' : 'not_detected', source: 'paddleocr_primary', aiAssisted: false };
-    declarations.marketer = { name: mktName, address: null, status: mktName ? 'verified' : 'not_detected', source: spatialPairs['marketer.name'] && mktName === spatialPairs['marketer.name'].value ? 'spatial_pairing' : 'paddleocr_primary', aiAssisted: false };
+    declarations.packer = { name: pkrName, address: null, status: pkrName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false };
+    declarations.importer = { name: impName, address: null, status: impName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false };
+    declarations.marketer = { name: mktName, address: null, status: mktName ? 'verified' : 'not_detected', source: spatialPairs['marketer.name'] && mktName === spatialPairs['marketer.name'].value ? 'spatial_pairing' : 'google_vision_primary', aiAssisted: false };
 
     validation.manufacturerPackerImporter = {
         status: (mfrName || pkrName || impName || mktName) ? 'verified' : 'not_detected',
@@ -1245,7 +1249,9 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (isDateShaped(tr) || isMarketingBadge(tr) || !/[a-zA-Z]{3,}/.test(tr)) return false;
 
         // Ban non-title content (nutrition, ingredients, dates, prices, addresses, etc.)
-        const isDisallowed = /^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|pkd|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommen|for feedback|customer|bath|lot|date|values|%?\s*rda|sugar|sodium|sodlum|cholesterol|tablets?|capsules?|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|vist|website|allergen|total|fish|guideline|council|processed|all\s*taxes)/i.test(tr) ||
+        const isDisallowed = /^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|pkd|servings|serving|quantity|percent|energy|protein|fat|carbohydrate|all values|dietary|ins\s*\d|preservative|humectant|approx|per|recommen|for feedback|customer|bath|lot|date|values|%?\s*rda|sugar|sodium|sodlum|cholesterol|tablets?|capsules?|acid|fatty|usp|rs\.?|price|unit\s*sale|call|phone|email|visit|vist|website|allergen|total|guideline|council|processed|all\s*taxes)/i.test(tr) ||
+            /\b(?:sugars?|cholesterol|sodium|calories|kcal)\b/i.test(tr) ||
+            /\b(?:saturated|trans)\s*fat\b/i.test(tr) ||
             /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr) ||
             /\b(?:kcal|cal|mg|mcg|g|ml|kg)\b/i.test(tr) ||
             /(?:ceutical|nutraceutical|supplement)\b/i.test(tr) ||
@@ -1310,6 +1316,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
         // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
         if (/^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|quantity|energy|protein|fat|carbohydrate|sugar|sodium|sodlum|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution|recommen|customer|feedback|processed|total|fish)/i.test(tr)) return false;
+        if (/\b(?:sugars?|cholesterol|sodium|energy|protein|carbohydrate)\b/i.test(tr)) return false;
+        if (/\b(?:saturated|trans)\s*fat\b/i.test(tr)) return false;
         if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr)) return false;
         if (/servings?\b/i.test(tr)) return false;
         if (/(?:ceutical|nutraceutical|supplement)\b/i.test(tr)) return false;

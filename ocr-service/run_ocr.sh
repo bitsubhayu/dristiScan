@@ -1,4 +1,10 @@
 #!/bin/bash
-cd /mnt/c/Users/subha/OneDrive/Documents/Antigravity_Workspace/DrishtiScan/ocr-service
-source .venv/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
+export PORT="${PORT:-8001}"
 python3 app.py

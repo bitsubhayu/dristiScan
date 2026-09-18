@@ -3,7 +3,7 @@ const http = require('http');
 const FormData = require('form-data');
 const crypto = require('crypto');
 
-const OCR_SERVICE_URL = process.env.OCR_SERVICE_URL || 'http://127.0.0.1:8000';
+const OCR_SERVICE_URL = process.env.OCR_SERVICE_URL || 'http://127.0.0.1:8001';
 const ipv4Agent = new http.Agent({ family: 4 });
 
 /**
@@ -42,13 +42,14 @@ const runOCR = async (imageBuffer, originalname = 'label.jpg', mimetype = 'image
         return response.data;
     } catch (error) {
         const elapsed = Date.now() - startTime;
-        console.error(`[OCR Client Error] Failed for "${originalname}" (hash: ${hash}) after ${elapsed}ms: ${error.message}`);
+        const detailedError = error.response?.data?.error || error.message;
+        console.error(`[OCR Client Error] Failed for "${originalname}" (hash: ${hash}) after ${elapsed}ms: ${detailedError}`);
         
         // Return structured failure response with ZERO fabricated data
         return {
             success: false,
-            error: error.message,
-            model: "PP-OCRv6",
+            error: detailedError,
+            model: "Google Cloud Vision",
             processingTimeMs: elapsed,
             results: [] // Strict safety rule: Never invent mock or demo values!
         };

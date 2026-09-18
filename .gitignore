@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 !**/.env.example
+*credentials*.json
+*.service-account.json
+*gcp-key*.json
+*service_account*.json
+gcp-credentials/
 
 # Node dependencies and build
 node_modules/
