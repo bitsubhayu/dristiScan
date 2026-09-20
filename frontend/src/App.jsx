@@ -9,7 +9,22 @@ import {
 } from 'lucide-react';
 import './App.css';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// Configurable API base URL:
+// 1. Reads VITE_API_URL from environment (e.g. Vercel dashboard)
+// 2. Sanitizes whitespace and trailing slashes
+// 3. In production, falls back to the active Render production backend
+// 4. In local development, falls back to http://localhost:5000
+const getApiBaseUrl = () => {
+  const envUrl = import.meta.env.VITE_API_URL;
+  if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
+    return envUrl.trim().replace(/\/+$/, '');
+  }
+  return import.meta.env.PROD
+    ? 'https://dristiscan-backend-lbzw.onrender.com'
+    : 'http://localhost:5000';
+};
+
+const API = getApiBaseUrl();
 
 axios.defaults.baseURL = API;
 axios.defaults.withCredentials = true;
