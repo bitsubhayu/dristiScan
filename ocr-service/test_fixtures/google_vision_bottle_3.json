@@ -1,0 +1,135 @@
+{
+  "success": true,
+  "model": "Google Cloud Vision (Offline Fixture - Captured Label Data)",
+  "processingTimeMs": 28.2,
+  "totalDetectedLines": 25,
+  "exactVisionGeometryAvailable": false,
+  "notes": "Exact Google Cloud Vision bounding-box polygon vertices are omitted (bbox: []) pending live Google Cloud Vision API billing enablement. Bounding boxes are not fabricated.",
+  "results": [
+    {
+      "text": "Coca-Cola",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Share a Coke with Ryan",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Carbonated Beverage",
+      "confidence": 0.95,
+      "bbox": []
+    },
+    {
+      "text": "20 FL OZ (1.25 PT) 591 mL",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "240 CALORIES PER BOTTLE",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "Nutrition Facts",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Serv. Size 1 Bottle",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Amount/Serving % DV*",
+      "confidence": 0.95,
+      "bbox": []
+    },
+    {
+      "text": "Total Fat 0g 0%",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Sodium 75mg 3%",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Total Carb. 65g 22%",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Sugars 65g",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Protein 0g",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "CARBONATED WATER, HIGH FRUCTOSE CORN SYRUP, CARAMEL COLOR, PHOSPHORIC ACID, NATURAL FLAVORS, CAFFEINE.",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "CAFFEINE CONTENT: 57 mg/20 fl oz",
+      "confidence": 0.96,
+      "bbox": []
+    },
+    {
+      "text": "LOW SODIUM",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "original formula",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "©2014 THE COCA-COLA COMPANY",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "CONSUMER INFORMATION CALL 1-800-438-2653",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "www.coke.com",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "please recycle",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "CA CRV NO REFILL",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "#ShareaCoke",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "mycoke rewards .com",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "04904403",
+      "confidence": 0.99,
+      "bbox": []
+    }
+  ]
+}

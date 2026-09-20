@@ -73,8 +73,15 @@ def google_vision_ocr(image_bytes: bytes, filename: str = None):
     """
     # 1. Check for explicit offline fixture mode
     if os.environ.get("USE_OFFLINE_FIXTURES") == "1":
-        print("[Google Vision Provider] Offline fixture mode active (USE_OFFLINE_FIXTURES=1). Returning fixture results.")
-        return load_fixture("google_vision_bottle_1.json")
+        fixture_name = "google_vision_bottle_1.json"
+        if filename:
+            fn = filename.lower()
+            if "bottle_2" in fn:
+                fixture_name = "google_vision_bottle_2.json"
+            elif "bottle_3" in fn or "coke" in fn or "cola" in fn:
+                fixture_name = "google_vision_bottle_3.json"
+        print(f"[Google Vision Provider] Offline fixture mode active (USE_OFFLINE_FIXTURES=1). Returning fixture: {fixture_name}")
+        return load_fixture(fixture_name)
 
     # 2. Live Google Cloud Vision API execution
     try:

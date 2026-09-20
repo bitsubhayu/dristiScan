@@ -400,6 +400,19 @@ const evaluateRules = async (extracted) => {
             }
         }
 
+        else if (code === 'LM-10' || valType === 'batch_lot' || rule.field === 'batchLotNumber') {
+            // Batch / Lot Number declaration
+            const batch = fields.batchNumber;
+            if (batch) {
+                status = 'PASS';
+                extractedValue = batch;
+                reason = `Batch / Lot number declared: ${batch}`;
+            } else {
+                status = 'INSUFFICIENT_EVIDENCE';
+                reason = 'Batch or lot number not established from available package photos.';
+            }
+        }
+
         else if (code === 'LM-12' || valType === 'visual_readability') {
             // Legibility & Character Readability
             if (isUnreadable) {

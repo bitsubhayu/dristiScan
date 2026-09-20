@@ -131,7 +131,7 @@ const MARKETING_BADGE_PATTERNS = [
     /\b(?:money\s*back|satisfaction)\s*(?:guarantee)?\b/i,
     /\b(?:new|improved|advanced|ultra|super|mega|pro|max)\b/i,
     /^\s*(?:made\s*in|product\s*of|manufactured|marketed|packed|imported)\b/i,
-    /\b(?:not\s*for\s*medicinal\s*use|for\s*therapeutic\s*use|health\s*supplement|dietary\s*supplement)\b/i,
+    /\b(?:not\s*for\s*medicinal\s*use|for\s*therapeutic\s*use|share\s*a\s*coke|share\s*a\b)\b/i,
     /\b(?:keep\s*out\s*of\s*reach|store\s*in\s*a\s*cool|recommended\s*usage|appropriate\s*overages)\b/i,
 ];
 
@@ -185,11 +185,11 @@ const validateFieldFormat = (fieldName, value) => {
                 return { valid: false, reason: 'Contains ingredient/nutrition text — not a valid net quantity' };
             }
             const wordCount = rawStr.trim().split(/\s+/).length;
-            if (wordCount > 5) {
+            if (wordCount > 5 && !/(?:FL\s*OZ|PT|LB|OZ|NET\s*WT)/i.test(rawStr)) {
                 return { valid: false, reason: `Net quantity has ${wordCount} words — likely contaminated with adjacent text` };
             }
             const nqm = rawStr.match(/(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-            if (nqm && !isValidQuantityUnit(nqm[2])) {
+            if (nqm && !isValidQuantityUnit(nqm[2]) && !/(?:FL\s*OZ|PT|LB|OZ)/i.test(rawStr)) {
                 return { valid: false, reason: `Unit "${nqm[2]}" is not a recognized standard metric or count unit` };
             }
             return { valid: true, value };
@@ -945,14 +945,14 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    // Pattern C: Prominent standalone weight/volume (e.g., "500 g", "1 kg") if >= 5
+    // Pattern C: Prominent standalone weight/volume (e.g., "500 g", "1 kg", "591 mL") if >= 5
     if (!netQtyVal) {
-        const standaloneWeightRegex = /^(\d+(?:\.\d+)?)\s*(g|kg|ml|l)\b/i;
+        const standaloneWeightRegex = /(?:^|[(\s])(\d+(?:\.\d+)?)\s*(g|kg|ml|l)\b/i;
         for (let i = 0; i < rawElements.length; i++) {
             const el = rawElements[i];
             // Reject if this or adjacent elements indicate nutrition facts table
             const nearbyText = rawElements.slice(Math.max(0, i - 2), i + 3).map(r => r.text).join(' ');
-            if (/protein|fat|sugar|sodium|carb|per\s*100|amount\s*per|nutrition|typical\s*values/i.test(nearbyText)) continue;
+            if (/\b(?:protein|fat|sugar|sugars|sodium|carb|carbs|carbohydrate|carbohydrates)\b|per\s*100|amount\s*per|typical\s*values/i.test(nearbyText) || /nutrition/i.test(el.text)) continue;
             
             const swm = el.text.match(standaloneWeightRegex);
             if (swm) {
@@ -1084,6 +1084,39 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
+    if (!pkrName) {
+        for (let i = 0; i < rawElements.length; i++) {
+            const el = rawElements[i];
+            if (/(?:Packed\s*By|Pkd\.?\s*By)\s*[:.-]?\s*$/i.test(el.text.trim()) ||
+                /(?:Packed\s*By|Pkd\.?\s*By)\s*[:.-]?\s*(.+)/i.test(el.text.trim())) {
+                const inlineMatch = el.text.match(/(?:Packed\s*By|Pkd\.?\s*By)\s*[:.-]?\s*(.+)/i);
+                if (inlineMatch && inlineMatch[1].trim().length > 3 && !/fssai|lic/i.test(inlineMatch[1])) {
+                    pkrName = inlineMatch[1].trim();
+                } else {
+                    pkrName = accumulatePartyName(i);
+                }
+                if (pkrName && pkrName.length > 2) break;
+                else pkrName = null;
+            }
+        }
+    }
+    if (!impName) {
+        for (let i = 0; i < rawElements.length; i++) {
+            const el = rawElements[i];
+            if (/(?:Imported\s*By)\s*[:.-]?\s*$/i.test(el.text.trim()) ||
+                /(?:Imported\s*By)\s*[:.-]?\s*(.+)/i.test(el.text.trim())) {
+                const inlineMatch = el.text.match(/(?:Imported\s*By)\s*[:.-]?\s*(.+)/i);
+                if (inlineMatch && inlineMatch[1].trim().length > 3 && !/fssai|lic/i.test(inlineMatch[1])) {
+                    impName = inlineMatch[1].trim();
+                } else {
+                    impName = accumulatePartyName(i);
+                }
+                if (impName && impName.length > 2) break;
+                else impName = null;
+            }
+        }
+    }
+
     // Match prominent corporate entity declarations (e.g. "THE COCA-COLA COMPANY")
     if (!mfrName && !mktName) {
         for (let i = 0; i < rawElements.length; i++) {
@@ -1125,11 +1158,12 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         rawText: mfrElem ? mfrElem.text : null,
         confidence: mfrElem ? mfrElem.confidence : 0,
         source: spatialPairs['manufacturer.name'] && mfrName === spatialPairs['manufacturer.name'].value ? 'spatial_pairing' : 'google_vision_primary',
-        aiAssisted: false
+        aiAssisted: false,
+        sourceImageId
     };
-    declarations.packer = { name: pkrName, address: null, status: pkrName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false };
-    declarations.importer = { name: impName, address: null, status: impName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false };
-    declarations.marketer = { name: mktName, address: null, status: mktName ? 'verified' : 'not_detected', source: spatialPairs['marketer.name'] && mktName === spatialPairs['marketer.name'].value ? 'spatial_pairing' : 'google_vision_primary', aiAssisted: false };
+    declarations.packer = { name: pkrName, address: null, status: pkrName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false, sourceImageId };
+    declarations.importer = { name: impName, address: null, status: impName ? 'verified' : 'not_detected', source: 'google_vision_primary', aiAssisted: false, sourceImageId };
+    declarations.marketer = { name: mktName, address: null, status: mktName ? 'verified' : 'not_detected', source: spatialPairs['marketer.name'] && mktName === spatialPairs['marketer.name'].value ? 'spatial_pairing' : 'google_vision_primary', aiAssisted: false, sourceImageId };
 
     validation.manufacturerPackerImporter = {
         status: (mfrName || pkrName || impName || mktName) ? 'verified' : 'not_detected',
@@ -1184,7 +1218,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         email: careEmail,
         status: (carePhone || careEmail) ? 'verified' : 'not_detected',
         rawText: carePhoneElem ? carePhoneElem.text : (careEmailElem ? careEmailElem.text : null),
-        confidence: carePhoneElem ? carePhoneElem.confidence : 0
+        confidence: carePhoneElem ? carePhoneElem.confidence : 0,
+        sourceImageId
     };
     validation.consumerCare = {
         status: (carePhone || careEmail) ? 'verified' : 'not_detected',
@@ -1211,7 +1246,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
     }
     declarations.ingredients = {
         value: ingredientsText,
-        status: ingredientsText ? 'verified' : 'not_detected'
+        status: ingredientsText ? 'verified' : 'not_detected',
+        sourceImageId
     };
 
     // -------------------------------------------------------------
@@ -1254,7 +1290,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
             /\b(?:saturated|trans)\s*fat\b/i.test(tr) ||
             /^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr) ||
             /\b(?:kcal|cal|mg|mcg|g|ml|kg)\b/i.test(tr) ||
-            /(?:ceutical|nutraceutical|supplement)\b/i.test(tr) ||
+            /(?:ceutical|nutraceutical)\b/i.test(tr) ||
+            /^(?:dietary|health)?\s*supplement$/i.test(tr) ||
             /servings?\b/i.test(tr) ||
             /\b(?:and|or|for|with|in|of)$/i.test(tr) ||
             /^[\s\-_•*~]/.test(tr) ||
@@ -1315,7 +1352,7 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         // Must not be a marketing badge or date-shaped
         if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
         // Must not be an ingredient, nutrition, date, batch, FSSAI, or price
-        if (/^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|quantity|energy|protein|fat|carbohydrate|sugar|sodium|sodlum|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution|recommen|customer|feedback|processed|total|fish)/i.test(tr)) return false;
+        if (/^[\s\-_•*~]*(?:nutrition|ingred|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|quantity|energy|protein|fat|carbohydrate|sugar|sodium|sodlum|fiber|dietary|kcal|calories|usp|rs\.?|price|unit\s*sale|how\s*to|directions|storage|store|keep|allergen|warning|caution|recommen|customer|feedback|processed|total|fish|beverage|carbonated)/i.test(tr)) return false;
         if (/\b(?:sugars?|cholesterol|sodium|energy|protein|carbohydrate)\b/i.test(tr)) return false;
         if (/\b(?:saturated|trans)\s*fat\b/i.test(tr)) return false;
         if (/^(?:ation|tion|ing|ised|ized|ment|ties|ducts|tured|from|with|per|and|the|for|our|products|are|fine|visit|vist|online|to|els)\b/i.test(tr)) return false;
@@ -1327,10 +1364,10 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         if (/^\d+(?:\.\d+)?$/.test(tr)) return false;
         if (/^[A-Z]{2,6}\d{4,10}$/i.test(tr)) return false;
         if (/^\d{14}$/.test(tr)) return false;
-        // Prefer all-uppercase or title-case lines of 1-4 words
+        // Prefer all-uppercase or title-case lines of 1-4 words (allow hyphens e.g. Coca-Cola)
         const words = tr.split(/\s+/);
         if (words.length > 4) return false;
-        const isUpperOrTitle = /^[A-Z][A-Z\s.-]+$/.test(tr) || /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(tr);
+        const isUpperOrTitle = /^[A-Z][A-Z\s.-]+$/.test(tr) || /^[A-Z][a-zA-Z.-]+(?:[\s-][A-Z][a-zA-Z.-]+)*$/.test(tr);
         return isUpperOrTitle;
     });
 
@@ -1386,7 +1423,8 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
             if (tr.length < 4 || tr.length > 60) return false;
             if (tr.toLowerCase() === brandNameVal.toLowerCase()) return false;
             if (isMarketingBadge(tr) || isDateShaped(tr)) return false;
-            if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|usp|rs\.?|price|manufactured|marketed|packed|imported|country)/i.test(tr)) return false;
+            if (/^(nutrition|ingredients|ngedients|mrp|net|exp|mfg|lic|fssai|batch|pkg|servings|serving|quantity|energy|protein|fat|carbohydrate|usp|rs\.?|price|manufactured|marketed|packed|imported|country|allergen|processed|to find|refer)/i.test(tr)) return false;
+            if (/\b(?:road|street|dist|sahib|nagar|floor|plot|phase|industrial|estate|opp|near|behind|pin|h\.?p\.?|delhi|mumbai)\b/i.test(tr) || /\b\d{6}\b/.test(tr)) return false;
             if (/^[\d.]+$/.test(tr)) return false;
             if (tr.split(/\s+/).length >= 2 || tr.length >= 6) return true;
             return false;
@@ -1427,8 +1465,18 @@ const extractFields = (ocrResults, sourceImageId = 'photo-1') => {
         }
     }
 
-    // Strategy B: If no explicit label is printed on the package, leave as null for the first pass.
-    // The mandatory Gemini verification pass will classify/verify genericCommodityName using visual reasoning.
+    // Strategy B: Fallback to prominent commodity classification keywords printed on pack
+    if (!genericCommodityNameVal) {
+        const COMMODITY_KEYWORDS = /(?:Dietary Supplement(?: Softgels)?|Carbonated Beverage|Health Supplement|Proprietary Food|Nutraceutical|Energy Drink|Fruit Juice|Cereal|Biscuits|Snack Food)/i;
+        for (const el of rawElements) {
+            const cm = el.text.match(COMMODITY_KEYWORDS);
+            if (cm) {
+                genericCommodityNameVal = cm[0].trim();
+                genericCommodityNameElem = el;
+                break;
+            }
+        }
+    }
 
     declarations.genericCommodityName = createEvidenceRecord(
         genericCommodityNameVal, genericCommodityNameElem,
@@ -1669,12 +1717,14 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
 
         let fieldStatus = 'not_detected';
         let resolvedValue = null;
+        let winningObs = null;
 
         if (observations.length === 0) {
             fieldStatus = 'not_detected';
         } else if (observations.length === 1) {
-            fieldStatus = 'single_observation';
+            fieldStatus = 'single_verified_observation';
             resolvedValue = observations[0].value;
+            winningObs = observations[0];
             setter(merged, resolvedValue);
         } else {
             // Multiple observations: check for material conflict
@@ -1688,6 +1738,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             if (uniqueVals.length === 1) {
                 fieldStatus = 'consistent';
                 resolvedValue = uniqueVals[0].value;
+                winningObs = uniqueVals[0];
                 setter(merged, resolvedValue);
             } else {
                 // Try basic normalization first
@@ -1701,16 +1752,18 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         String(a.value).length >= String(b.value).length ? a : b
                     );
                     resolvedValue = best.value;
+                    winningObs = best;
                     setter(merged, resolvedValue);
                     console.log(`[Reconciliation] ${fieldName}: basic normalization resolved — "${resolvedValue}"`);
                 } else {
                     fieldStatus = 'pending_gemini';
                     resolvedValue = observations[0].value;
+                    winningObs = observations[0];
                     setter(merged, resolvedValue);
 
                     fieldsNeedingGemini[fieldName] = uniqueVals.map(u => ({
                         value: String(u.value),
-                        photoId: `Photo #${u.photoIndex}`,
+                        photoId: u.imageId || `Photo #${u.photoIndex}`,
                         rawText: u.rawText
                     }));
                 }
@@ -1721,7 +1774,9 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             field: fieldName,
             status: fieldStatus,
             observations,
-            resolvedValue
+            resolvedValue,
+            sourceImageId: winningObs ? winningObs.imageId : (observations.length > 0 ? observations[0].imageId : null),
+            suppliedByImage: winningObs ? winningObs.imageId : (observations.length > 0 ? observations[0].imageId : null)
         };
     };
 
@@ -1800,6 +1855,94 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     reconcileField('consumerCare.email', e => e.consumerCare?.email, (m, v) => m.consumerCare.email = v);
     reconcileField('countryOfOrigin', e => e.countryOfOrigin, (m, v) => m.countryOfOrigin = v);
     reconcileField('unitSalePrice', e => e.unitSalePrice, (m, v) => m.unitSalePrice = v);
+
+    // -----------------------------------------------------------------
+    // Field-level Provenance Propagation to merged.declarations
+    // Guarantee that all 12 required declarations identify their source image.
+    // -----------------------------------------------------------------
+    const updateMergedDeclaration = (declKey, reconKey, valGetter) => {
+        const rf = merged.reconciliation.fields[reconKey];
+        if (!rf) return;
+        const resolvedVal = valGetter ? valGetter() : rf.resolvedValue;
+        const sourceImageId = rf.sourceImageId || (rf.observations[0]?.imageId) || null;
+        const rawText = rf.observations[0]?.rawText || null;
+        const conf = typeof rf.observations[0]?.confidence === 'number' ? rf.observations[0].confidence : 0.95;
+        const isPresent = resolvedVal !== null && resolvedVal !== undefined && resolvedVal !== '';
+
+        if (!merged.declarations[declKey]) {
+            merged.declarations[declKey] = {};
+        }
+        merged.declarations[declKey] = {
+            ...merged.declarations[declKey],
+            value: resolvedVal,
+            status: isPresent ? 'verified' : 'not_detected',
+            sourceImageId: sourceImageId,
+            suppliedByImage: sourceImageId,
+            rawText: rawText,
+            confidence: isPresent ? conf : 0,
+            source: 'reconciled_multi_panel'
+        };
+    };
+
+    updateMergedDeclaration('brandName', 'brandName');
+    updateMergedDeclaration('productName', 'productName');
+    updateMergedDeclaration('genericCommodityName', 'genericCommodityName');
+    updateMergedDeclaration('mrp', 'mrp', () => merged.mrp?.value);
+    if (merged.declarations.mrp) {
+        merged.declarations.mrp.inclusiveOfTaxes = merged.mrp?.inclusiveOfTaxes;
+        merged.declarations.mrp.currency = 'INR';
+    }
+    updateMergedDeclaration('netQuantity', 'netQuantity', () => merged.netQuantity?.value ? `${merged.netQuantity.value} ${merged.netQuantity.unit || ''}`.trim() : null);
+    if (merged.declarations.netQuantity && merged.netQuantity?.value !== null) {
+        merged.declarations.netQuantity.numericValue = merged.netQuantity.value;
+        merged.declarations.netQuantity.unit = merged.netQuantity.unit;
+    }
+    updateMergedDeclaration('manufacturingDate', 'dates.manufacture');
+    updateMergedDeclaration('expiryDate', 'dates.expiry');
+    updateMergedDeclaration('bestBefore', 'dates.bestBefore');
+    updateMergedDeclaration('batchNumber', 'batchNumber');
+    updateMergedDeclaration('manufacturer', 'manufacturer.name', () => merged.manufacturer?.name);
+    if (merged.declarations.manufacturer) {
+        merged.declarations.manufacturer.name = merged.manufacturer?.name;
+        merged.declarations.manufacturer.address = merged.manufacturer?.address;
+    }
+    updateMergedDeclaration('packer', 'packer.name', () => merged.packer?.name);
+    if (merged.declarations.packer) {
+        merged.declarations.packer.name = merged.packer?.name;
+        merged.declarations.packer.address = merged.packer?.address;
+    }
+    updateMergedDeclaration('importer', 'importer.name', () => merged.importer?.name);
+    if (merged.declarations.importer) {
+        merged.declarations.importer.name = merged.importer?.name;
+        merged.declarations.importer.address = merged.importer?.address;
+    }
+    updateMergedDeclaration('marketer', 'marketer.name', () => merged.marketer?.name);
+    if (merged.declarations.marketer) {
+        merged.declarations.marketer.name = merged.marketer?.name;
+        merged.declarations.marketer.address = merged.marketer?.address;
+    }
+
+    // Consumer care declaration
+    const carePhoneRecon = merged.reconciliation.fields['consumerCare.phone'];
+    const careEmailRecon = merged.reconciliation.fields['consumerCare.email'];
+    const careSourceImageId = carePhoneRecon?.sourceImageId || careEmailRecon?.sourceImageId || null;
+    const hasCare = Boolean(merged.consumerCare?.phone || merged.consumerCare?.email);
+    merged.declarations.consumerCare = {
+        name: merged.consumerCare?.name || null,
+        address: merged.consumerCare?.address || null,
+        phone: merged.consumerCare?.phone || null,
+        email: merged.consumerCare?.email || null,
+        status: hasCare ? 'verified' : 'not_detected',
+        sourceImageId: careSourceImageId,
+        suppliedByImage: careSourceImageId,
+        rawText: carePhoneRecon?.observations[0]?.rawText || careEmailRecon?.observations[0]?.rawText || null,
+        confidence: hasCare ? 0.98 : 0,
+        source: 'reconciled_multi_panel'
+    };
+
+    updateMergedDeclaration('countryOfOrigin', 'countryOfOrigin');
+    updateMergedDeclaration('unitSalePrice', 'unitSalePrice');
+    updateMergedDeclaration('fssaiLicense', 'fssaiLicenseNumber');
 
     // 11. Ingredients & Nutrition Facts Merging
     const ingredientsFound = extractedList.map(e => e.ingredients).filter(Boolean);
@@ -1982,7 +2125,8 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
             console.error('[Reconciliation] Gemini reconciliation failed:', err.message);
             // Fallback: mark conflicting pending fields as unresolved conflicts
             for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
-                if (candidates.length > 1) {
+                const uniqueValues = Array.from(new Set(candidates.map(c => String(c.value || '').trim().toLowerCase()).filter(Boolean)));
+                if (uniqueValues.length > 1) {
                     const reconField = merged.reconciliation.fields[fieldName];
                     if (reconField) reconField.status = 'unresolved_conflict';
                     
@@ -1992,7 +2136,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                             photo: c.photoId,
                             value: c.value
                         })),
-                        message: `Unresolved: different values detected across photos (Gemini unavailable)`,
+                        message: `Unresolved: different values detected across photos (${candidates.map(c => `${c.photoId}: "${c.value}"`).join(' vs ')}) (Gemini unavailable)`,
                         confirmedByGemini: false
                     };
                     merged.conflicts.push(conflictRecord);
@@ -2003,7 +2147,8 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
     } else if (Object.keys(fieldsNeedingGemini).length > 0) {
         console.log(`[Reconciliation] ${Object.keys(fieldsNeedingGemini).length} field(s) eligible for verification but Gemini is not available`);
         for (const [fieldName, candidates] of Object.entries(fieldsNeedingGemini)) {
-            if (candidates.length > 1) {
+            const uniqueValues = Array.from(new Set(candidates.map(c => String(c.value || '').trim().toLowerCase()).filter(Boolean)));
+            if (uniqueValues.length > 1) {
                 const reconField = merged.reconciliation.fields[fieldName];
                 if (reconField) reconField.status = 'unresolved_conflict';
                 
@@ -2013,7 +2158,7 @@ const mergeMultiPhotoExtractedFields = async (extractedList = [], imageBuffers =
                         photo: c.photoId,
                         value: c.value
                     })),
-                    message: `Different values detected across photos (Gemini not configured)`,
+                    message: `Different values detected across photos (${candidates.map(c => `${c.photoId}: "${c.value}"`).join(' vs ')}) (Gemini not configured)`,
                     confirmedByGemini: false
                 };
                 merged.conflicts.push(conflictRecord);

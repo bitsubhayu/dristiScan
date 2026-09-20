@@ -1,0 +1,135 @@
+{
+  "success": true,
+  "model": "Google Cloud Vision (Offline Fixture - Captured Label Data)",
+  "processingTimeMs": 26.4,
+  "totalDetectedLines": 25,
+  "exactVisionGeometryAvailable": false,
+  "notes": "Exact Google Cloud Vision bounding-box polygon vertices are omitted (bbox: []) pending live Google Cloud Vision API billing enablement. Bounding boxes are not fabricated.",
+  "results": [
+    {
+      "text": "INGREDIENTS: Fish Oil, Gelling Agent (INS 428), Humectants (INS 422, INS 420), Preservatives (INS 218, INS 219)",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "ALLERGENS: CONTAINS FISH",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Processed in a plant where soy & milk containing products are manufactured.",
+      "confidence": 0.96,
+      "bbox": []
+    },
+    {
+      "text": "RECOMMENDED USAGE LEVEL: 1 Softgel (Approx. 1.425g) per day.",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "To find out more about the science and ingredients behind our products, visit OPTIMUMNUTRITION.CO.IN.",
+      "confidence": 0.96,
+      "bbox": []
+    },
+    {
+      "text": "Optimum Nutrition",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Fish Oil Dietary Supplement Softgels",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Manufactured By: Tirupati Lifesciences Pvt. Ltd.",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Nahan Road, Paonta Sahib, Dist. Sirmour (H.P.) - 173025",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "Marketed By: Glanbia Performance Nutrition India Pvt. Ltd.",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Packed By: Glanbia Performance Nutrition India Pvt. Ltd.",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "Imported By: Glanbia Performance Nutrition India Pvt. Ltd.",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "Country of Origin: India",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "For Feedback or in case of any queries and complaints please contact our Customer Care Team. Address: Refer Marketer Address",
+      "confidence": 0.96,
+      "bbox": []
+    },
+    {
+      "text": "Customer Care Number: +91-11-49594959",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Email: indiacustomercare@glanbia.com",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Batch No.: ONFO26005",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "Mfg. Date: MAY 2026",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Exp. Date: NOV 2027",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "PKD on: 13-05-2026 15:22",
+      "confidence": 0.96,
+      "bbox": []
+    },
+    {
+      "text": "MRP: 666.00",
+      "confidence": 0.99,
+      "bbox": []
+    },
+    {
+      "text": "(inclusive of all taxes)",
+      "confidence": 0.97,
+      "bbox": []
+    },
+    {
+      "text": "Unit Sale Price: Rs. 11.10 / Cap.",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Rs. per capsule: USP 11.10/Cap.",
+      "confidence": 0.98,
+      "bbox": []
+    },
+    {
+      "text": "Refer Marketer Address",
+      "confidence": 0.95,
+      "bbox": []
+    }
+  ]
+}
