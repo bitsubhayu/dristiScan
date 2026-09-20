@@ -62,7 +62,7 @@ def get_ocr():
 # =============================================================================
 # Phase 5 Fix 4: CLAHE Contrast Enhancement
 # Specifically helps dark-background, light-text style labels seen on glossy
-# bottles (e.g., Optimum Nutrition). Applied before OCR inference.
+# packaging (e.g., dark-background, glossy-label products). Applied before OCR inference.
 # =============================================================================
 def apply_clahe(img):
     """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to improve
@@ -76,12 +76,13 @@ def apply_clahe(img):
     return enhanced
 
 # =============================================================================
-# Phase 5 Fix 4: Image Tiling for Large Photos
-# For large, high-resolution packaging photos, split into overlapping tiles
-# and run OCR on each to avoid losing small dense text (nutrition panels,
-# fine print) to internal downscaling.
+# Phase 5 Fix 4 + Speed Upgrade: Three-tier Image Routing & Tiling Fallback
+# 1. Ultra-large images (> 2560px) run tiled OCR at full resolution to preserve fine statutory print.
+# 2. Large phone photos (1920-2560px) are scaled to MAX_IMAGE_DIM (1920px) for fast single-pass.
+# 3. Standard images (<= 1920px) run single-pass at native resolution.
 # =============================================================================
-TILE_THRESHOLD = 2560  # Only tile images larger than this on any side
+MAX_IMAGE_DIM = 1920   # Controlled maximum dimension for single-pass fast path (preserves aspect ratio)
+TILE_THRESHOLD = 2560  # Ultra-large images above this on any side trigger full-resolution tiled OCR
 TILE_SIZE = 1920       # Each tile is at most this size
 TILE_OVERLAP = 0.15    # 15% overlap between adjacent tiles
 
@@ -181,8 +182,86 @@ def run_tiled_ocr(img):
     # Deduplicate overlapping detections
     return deduplicate_results(all_results)
 
+def sort_results_spatially(results):
+    """Sort OCR detections in natural visual reading order: top-to-bottom, left-to-right.
+    Groups detections into visual rows using vertical center and bounding box height,
+    then sorts elements within each row left-to-right by horizontal position.
+    Preserves all confidence and metadata.
+    """
+    if len(results) <= 1:
+        return results
+
+    valid_elements = []
+    empty_elements = []
+
+    for r in results:
+        bbox = r.get("bbox", [])
+        if bbox and len(bbox) >= 4:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            height = max(1.0, float(y_max - y_min))
+            center_y = (y_min + y_max) / 2.0
+            valid_elements.append({
+                "item": r,
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+                "center_y": center_y,
+                "height": height
+            })
+        else:
+            empty_elements.append(r)
+
+    if not valid_elements:
+        return results
+
+    # Initial coarse sort by vertical position then horizontal position
+    valid_elements.sort(key=lambda e: (e["y_min"], e["x_min"]))
+
+    # Group into visual rows based on vertical proximity and overlap
+    rows = []
+    for elem in valid_elements:
+        matched_row = None
+        for row in rows:
+            row_cy = row["center_y"]
+            row_h = row["height"]
+            vertical_tol = max(row_h, elem["height"]) * 0.5
+            if abs(elem["center_y"] - row_cy) <= vertical_tol:
+                matched_row = row
+                break
+
+        if matched_row is not None:
+            matched_row["elements"].append(elem)
+            n = len(matched_row["elements"])
+            matched_row["center_y"] = ((matched_row["center_y"] * (n - 1)) + elem["center_y"]) / n
+            matched_row["height"] = max(matched_row["height"], elem["height"])
+        else:
+            rows.append({
+                "center_y": elem["center_y"],
+                "height": elem["height"],
+                "elements": [elem]
+            })
+
+    # Sort rows top-to-bottom by center_y
+    rows.sort(key=lambda r: r["center_y"])
+
+    # Sort elements within each row left-to-right by x_min
+    sorted_results = []
+    for row in rows:
+        row["elements"].sort(key=lambda e: e["x_min"])
+        for e in row["elements"]:
+            sorted_results.append(e["item"])
+
+    sorted_results.extend(empty_elements)
+    return sorted_results
+
 def deduplicate_results(results):
-    """Remove duplicate detections from overlapping tiles using bbox IoU."""
+    """Remove duplicate detections from overlapping tiles using bbox IoU.
+    Final output is spatially ordered: top-to-bottom, left-to-right.
+    """
     if len(results) <= 1:
         return results
 
@@ -205,7 +284,7 @@ def deduplicate_results(results):
         if not is_duplicate:
             kept.append(candidate)
 
-    return kept
+    return sort_results_spatially(kept)
 
 
 # =============================================================================
@@ -223,7 +302,8 @@ async def startup_event():
     print("  - CLAHE contrast enhancement: ON")
     print("  - Detection side length limit: 2560")
     print("  - Recognition score threshold: 0.3 (lowered)")
-    print(f"  - Tiling threshold: {TILE_THRESHOLD}px")
+    print(f"  - Tiling threshold: {TILE_THRESHOLD}px (ultra-large images > {TILE_THRESHOLD}px use full-res tiling)")
+    print(f"  - Controlled downscale: {MAX_IMAGE_DIM}px (images between {MAX_IMAGE_DIM}px and {TILE_THRESHOLD}px)")
     print("  - Model loaded in background worker: YES")
     print("="*50 + "\n")
     # Initiate model warm-up in background thread so HTTP server binds port immediately
@@ -249,7 +329,9 @@ def health_check():
         "cpuThreads": 6,
         "phase5Enhancements": {
             "clahe": True,
+            "routing": "three-tier (tiled >2560px, resized 1920-2560px, native <=1920px)",
             "tilingThreshold": TILE_THRESHOLD,
+            "maxImageDim": MAX_IMAGE_DIM,
             "detLimitSideLen": 2560,
             "recScoreThresh": 0.3,
             "modelLoadedOnce": True
@@ -288,37 +370,44 @@ async def perform_ocr(image: UploadFile = File(...)):
     orig_h, orig_w = img.shape[:2]
 
     # -------------------------------------------------------------------------
-    # Phase 5 Fix 4: CLAHE contrast enhancement
-    # Improves readability of dark-background labels, glossy/glare-heavy surfaces
+    # Issue 8: Execution routing based on ORIGINAL photo dimensions.
+    # 1. Ultra-large image (> TILE_THRESHOLD 2560px): preserve full resolution
+    #    via tiling so fine statutory print isn't lost to downscaling.
+    # 2. Normal large phone photo (> MAX_IMAGE_DIM 1920px): fast single-pass path
+    #    via controlled downscale to 1920px.
+    # 3. Standard photo (<= MAX_IMAGE_DIM 1920px): single-pass at original scale.
     # -------------------------------------------------------------------------
-    enhanced_img = apply_clahe(img)
+    if max(orig_h, orig_w) > TILE_THRESHOLD:
+        scale = 1.0
+        enhanced_img = apply_clahe(img)
+        use_tiling = True
+    elif max(orig_h, orig_w) > MAX_IMAGE_DIM:
+        scale = MAX_IMAGE_DIM / float(max(orig_h, orig_w))
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        enhanced_img = apply_clahe(resized_img)
+        use_tiling = False
+    else:
+        scale = 1.0
+        enhanced_img = apply_clahe(img)
+        use_tiling = False
 
     start_time = time.time()
 
-    # -------------------------------------------------------------------------
-    # Phase 5 Fix 4: Tiling for large images
-    # If the image exceeds TILE_THRESHOLD, split into overlapping tiles to avoid
-    # losing small dense text to internal downscaling
-    # -------------------------------------------------------------------------
-    use_tiling = max(orig_h, orig_w) > TILE_THRESHOLD
-
     if use_tiling:
-        print(f"[OCR] Large image detected ({orig_w}x{orig_h}), using tiled OCR...")
-        formatted_results = run_tiled_ocr(enhanced_img)
+        print(f"[OCR] Ultra-large image detected ({orig_w}x{orig_h} > {TILE_THRESHOLD}px), using tiled OCR at full resolution...")
+        tiled_results = run_tiled_ocr(enhanced_img)
+        formatted_results = []
+        for r in tiled_results:
+            formatted_results.append({
+                "text": r["text"],
+                "confidence": r["confidence"],
+                "bbox": r.get("bbox", [])
+            })
     else:
-        # Standard path: scale to reasonable size for CPU inference
-        max_dim = 2560  # Raised from 1920 to preserve more detail (Phase 5 Fix 4)
-        if max(orig_h, orig_w) > max_dim:
-            scale = max_dim / float(max(orig_h, orig_w))
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            proc_img = cv2.resize(enhanced_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            scale = 1.0
-            proc_img = enhanced_img
-
-        # Run PaddleOCR
-        result = model.predict(proc_img)
+        # Standard path: single PaddleOCR pass
+        result = model.predict(enhanced_img)
 
         formatted_results = []
 
@@ -357,10 +446,12 @@ async def perform_ocr(image: UploadFile = File(...)):
         "phase5": {
             "claheApplied": True,
             "tilingUsed": use_tiling,
+            "scale": round(scale, 4),
+            "maxImageDim": MAX_IMAGE_DIM,
             "detLimitSideLen": 2560,
             "recScoreThresh": 0.3
         },
-        "results": formatted_results
+        "results": sort_results_spatially(formatted_results)
     }
 
 if __name__ == "__main__":

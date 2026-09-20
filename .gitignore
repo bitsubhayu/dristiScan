@@ -69,3 +69,5 @@ Thumbs.db
 *.swp
 *.swo
 .agents/
+google-cloud-sdk/
+backend/bottle_*.json
